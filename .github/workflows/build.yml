@@ -1,0 +1,103 @@
+name: Build & Release Persona 1 PC Recomp
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MinGW & Ninja
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Set up Environment Variables
+        run: |
+          echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+
+      - name: Build PSP Recomp Runtime Library
+        shell: powershell
+        run: |
+          cmake -B tools/psprecomp/build -S tools/psprecomp -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build tools/psprecomp/build --config Release
+
+      - name: Build Game & Launcher Executables
+        shell: powershell
+        run: |
+          cmake -B build_pc -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build_pc --config Release
+
+      - name: Prepare Release Package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path dist -Force
+          Copy-Item build_pc/persona_launcher.exe dist/
+          Copy-Item build_pc/persona_pc.exe dist/
+          New-Item -ItemType Directory -Path dist/tools/pspdecrypt-bin -Force
+          Copy-Item tools/pspdecrypt-bin/pspdecrypt.exe dist/tools/pspdecrypt-bin/
+          
+          # Create default folders
+          New-Item -ItemType Directory -Path dist/savedata -Force
+          New-Item -ItemType Directory -Path dist/screenshots -Force
+          
+          # Create Instructions Readme for Players
+          @'
+          ========================================================================
+            Shin Megami Tensei: Persona (PSP) — Native PC Port (Recompiled)
+          ========================================================================
+
+          QUICK START GUIDE:
+          1. Run `persona_launcher.exe`.
+          2. Drag and drop or click "Select ISO File..." to choose your official 
+             dump of `Shin Megami Tensei - Persona (USA)` ISO (ULUS-10432).
+          3. Click "START AUTOMATIC RECOMPILATION". The launcher will extract, 
+             decrypt, and setup the game assets (done only once).
+          4. Click "PLAY PERSONA 1" to start!
+
+          CONTROLS:
+          - Movement / D-Pad : WASD or Arrow Keys | Left Analog Stick
+          - Confirm (Cross)  : Z / Space / J / Gamepad A
+          - Cancel (Circle)  : X / Esc / K / Gamepad B
+          - Menu (Square)    : C / U / Gamepad X
+          - Persona (Triangle: V / I / Gamepad Y
+          - Triggers (L / R) : Q / E / LShift / RShift / LB / RB
+          - Start / Select   : Enter / Tab / Backspace
+          - In-Game Menu (F1): Press F1 or Xbox Guide button to open Graphics,
+                               Audio, Fullscreen, and Controls configuration.
+
+          Enjoy native 60 FPS Persona 1!
+          '@ | Out-File -FilePath dist/HOW_TO_PLAY.txt -Encoding utf8
+
+          Compress-Archive -Path dist/* -DestinationPath persona1_pc_windows_x64.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: persona1_pc_windows_x64
+          path: persona1_pc_windows_x64.zip
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: persona1_pc_windows_x64.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+

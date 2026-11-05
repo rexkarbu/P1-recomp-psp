@@ -1,0 +1,69 @@
+# ==============================================================================
+# Persona 1 PSP PC Recompilation (.gitignore)
+# ==============================================================================
+
+# Commercial & Copyrighted Game Assets (Strictly Excluded - BYOG)
+*.iso
+*.ISO
+*.cso
+*.CSO
+*.bin
+*.BIN
+!tools/**/keys.bin
+game_root/
+extracted/
+USRDIR/
+SYSDIR/
+
+# Build Artefacts & Output Binaries
+build/
+build_pc/
+bin/
+*.exe
+!tools/pspdecrypt-bin/pspdecrypt.exe
+*.zip
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# CMake Generated Files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+ninja.build
+.ninja_log
+.ninja_deps
+
+# Game Runtime Data & Local User Configurations
+savedata/
+screenshots/
+states/
+install_manifest.txt
+launcher_config.ini
+*.state
+*.sav
+*.SAV
+
+# Debug Dumps & Visual Captures
+*.ppm
+*.png
+*.bmp
+!assets/**/*.png
+!assets/**/*.ico
+trace_ge.log
+*.log
+
+# IDE & Editor Configurations
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+*~
+
