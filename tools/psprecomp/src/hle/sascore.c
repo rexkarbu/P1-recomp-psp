@@ -193,7 +193,8 @@ static void render(int32_t *mix_l, int32_t *mix_r, uint32_t samples) {
 
             /* Pitch is a 12-bit fixed-point step: 0x1000 plays at the source
              * rate, 0x2000 an octave up. */
-            v->frac += v->pitch;
+            uint32_t step = v->pitch ? v->pitch : 0x1000;
+            v->frac += step;
             while (v->frac >= 0x1000) {
                 v->frac -= 0x1000;
                 v->sample_idx++;

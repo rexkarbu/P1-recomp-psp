@@ -186,11 +186,10 @@ static inline int clamp16(int v) {
 }
 
 #ifdef _WIN32
-#define HOST_AUDIO_BUFFERS 8
+#define HOST_AUDIO_BUFFERS 16
 
 typedef struct {
     HWAVEOUT hWaveOut;
-    HANDLE   hEvent;
     WAVEHDR  headers[HOST_AUDIO_BUFFERS];
     int16_t *pcm_buffers[HOST_AUDIO_BUFFERS];
     uint32_t buf_capacity_samples[HOST_AUDIO_BUFFERS];
@@ -218,10 +217,6 @@ static void host_audio_close_ch(int ch) {
         waveOutClose(g_host_audio[ch].hWaveOut);
         g_host_audio[ch].hWaveOut = NULL;
     }
-    if (g_host_audio[ch].hEvent) {
-        CloseHandle(g_host_audio[ch].hEvent);
-        g_host_audio[ch].hEvent = NULL;
-    }
     g_host_audio[ch].opened = 0;
     g_host_audio[ch].next_buf = 0;
 }
@@ -240,15 +235,10 @@ static int host_audio_open_ch(int ch) {
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize = 0;
 
-    g_host_audio[ch].hEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
     MMRESULT res = waveOutOpen(&g_host_audio[ch].hWaveOut, WAVE_MAPPER, &wfx,
-                              (DWORD_PTR)g_host_audio[ch].hEvent, 0, CALLBACK_EVENT);
+                              0, 0, CALLBACK_NULL);
     if (res != MMSYSERR_NOERROR) {
         fprintf(stderr, "audio: waveOutOpen failed for ch %d (err %u)\n", ch, (unsigned)res);
-        if (g_host_audio[ch].hEvent) {
-            CloseHandle(g_host_audio[ch].hEvent);
-            g_host_audio[ch].hEvent = NULL;
-        }
         return -1;
     }
 
@@ -279,27 +269,20 @@ static void host_audio_play(uint32_t ch, int vol_l, int vol_r, uint32_t buf_addr
     int channels = (g_audio[ch].format == 0x10) ? 1 : 2;
     uint32_t bytes = samples * (uint32_t)channels * sizeof(int16_t);
 
-    /* Find an available buffer slot, or wait for the hardware to finish playing one */
+    /* Find an available buffer slot (not prepared or already finished playing) */
     int slot = -1;
-    for (int retry = 0; retry < 50; retry++) {
-        for (int i = 0; i < HOST_AUDIO_BUFFERS; i++) {
-            int idx = (g_host_audio[ch].next_buf + i) % HOST_AUDIO_BUFFERS;
-            WAVEHDR *h = &g_host_audio[ch].headers[idx];
-            if (!(h->dwFlags & WHDR_PREPARED) || (h->dwFlags & WHDR_DONE)) {
-                slot = idx;
-                break;
-            }
-        }
-        if (slot >= 0) break;
-        if (g_host_audio[ch].hEvent) {
-            WaitForSingleObject(g_host_audio[ch].hEvent, 10);
-        } else {
-            Sleep(1);
+    for (int i = 0; i < HOST_AUDIO_BUFFERS; i++) {
+        int idx = (g_host_audio[ch].next_buf + i) % HOST_AUDIO_BUFFERS;
+        WAVEHDR *h = &g_host_audio[ch].headers[idx];
+        if (!(h->dwFlags & WHDR_PREPARED) || (h->dwFlags & WHDR_DONE)) {
+            slot = idx;
+            break;
         }
     }
 
     if (slot < 0) {
-        /* Device busy or stalled: drop frame instead of corrupting active DMA headers */
+        /* All 16 slots are still active in sound card driver (~93ms of buffer).
+         * Drop this frame to avoid blocking the CPU baton or corrupting DMA headers. */
         return;
     }
 
@@ -399,9 +382,18 @@ static void hle_OutputPanned(void) {
 
 #if PSPRECOMP_REAL_THREADS
 static uint64_t host_now_us(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart / freq.QuadPart) * 1000000ull +
+           (uint64_t)(now.QuadPart % freq.QuadPart) * 1000000ull / (uint64_t)freq.QuadPart;
+#else
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
 }
 static uint64_t g_audio_due_us[AUDIO_CHANNELS];
 #endif
@@ -418,13 +410,30 @@ static void hle_OutputBlocking(void) {
     host_audio_play(ch, vol, vol, buf);
 #endif
     g_audio_blocks++;
-    const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
+    const uint64_t play_us = (uint64_t)samples * 1000000ull / 44100ull;
 #if PSPRECOMP_REAL_THREADS
     if (ch < AUDIO_CHANNELS) {
         uint64_t now = host_now_us();
-        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
+        if (g_audio_due_us[ch] == 0 || g_audio_due_us[ch] < now) {
+            g_audio_due_us[ch] = now;
+        }
         g_audio_due_us[ch] += play_us;
-        psp_threadman_yield();
+
+        now = host_now_us();
+        if (g_audio_due_us[ch] > now) {
+            uint64_t lead_us = g_audio_due_us[ch] - now;
+            if (lead_us > 50000ull) {
+                g_audio_due_us[ch] = now + 50000ull;
+                lead_us = 50000ull;
+            }
+            if (lead_us >= 1000ull) {
+                psp_threadman_delay(lead_us);
+            } else {
+                psp_threadman_yield();
+            }
+        } else {
+            psp_threadman_yield();
+        }
     }
 #else
     psp_threadman_delay(play_us);
@@ -446,13 +455,30 @@ static void hle_OutputPannedBlocking(void) {
     host_audio_play(ch, leftvol, rightvol, buf);
 #endif
     g_audio_blocks++;
-    const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
+    const uint64_t play_us = (uint64_t)samples * 1000000ull / 44100ull;
 #if PSPRECOMP_REAL_THREADS
     if (ch < AUDIO_CHANNELS) {
         uint64_t now = host_now_us();
-        if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
+        if (g_audio_due_us[ch] == 0 || g_audio_due_us[ch] < now) {
+            g_audio_due_us[ch] = now;
+        }
         g_audio_due_us[ch] += play_us;
-        psp_threadman_yield();
+
+        now = host_now_us();
+        if (g_audio_due_us[ch] > now) {
+            uint64_t lead_us = g_audio_due_us[ch] - now;
+            if (lead_us > 50000ull) {
+                g_audio_due_us[ch] = now + 50000ull;
+                lead_us = 50000ull;
+            }
+            if (lead_us >= 1000ull) {
+                psp_threadman_delay(lead_us);
+            } else {
+                psp_threadman_yield();
+            }
+        } else {
+            psp_threadman_yield();
+        }
     }
 #else
     psp_threadman_delay(play_us);
