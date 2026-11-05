@@ -186,10 +186,11 @@ static inline int clamp16(int v) {
 }
 
 #ifdef _WIN32
-#define HOST_AUDIO_BUFFERS 32
+#define HOST_AUDIO_BUFFERS 8
 
 typedef struct {
     HWAVEOUT hWaveOut;
+    HANDLE   hEvent;
     WAVEHDR  headers[HOST_AUDIO_BUFFERS];
     int16_t *pcm_buffers[HOST_AUDIO_BUFFERS];
     uint32_t buf_capacity_samples[HOST_AUDIO_BUFFERS];
@@ -217,6 +218,10 @@ static void host_audio_close_ch(int ch) {
         waveOutClose(g_host_audio[ch].hWaveOut);
         g_host_audio[ch].hWaveOut = NULL;
     }
+    if (g_host_audio[ch].hEvent) {
+        CloseHandle(g_host_audio[ch].hEvent);
+        g_host_audio[ch].hEvent = NULL;
+    }
     g_host_audio[ch].opened = 0;
     g_host_audio[ch].next_buf = 0;
 }
@@ -235,9 +240,15 @@ static int host_audio_open_ch(int ch) {
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize = 0;
 
-    MMRESULT res = waveOutOpen(&g_host_audio[ch].hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
+    g_host_audio[ch].hEvent = CreateEventA(NULL, FALSE, FALSE, NULL);
+    MMRESULT res = waveOutOpen(&g_host_audio[ch].hWaveOut, WAVE_MAPPER, &wfx,
+                              (DWORD_PTR)g_host_audio[ch].hEvent, 0, CALLBACK_EVENT);
     if (res != MMSYSERR_NOERROR) {
         fprintf(stderr, "audio: waveOutOpen failed for ch %d (err %u)\n", ch, (unsigned)res);
+        if (g_host_audio[ch].hEvent) {
+            CloseHandle(g_host_audio[ch].hEvent);
+            g_host_audio[ch].hEvent = NULL;
+        }
         return -1;
     }
 
@@ -260,21 +271,36 @@ static void host_audio_play(uint32_t ch, int vol_l, int vol_r, uint32_t buf_addr
     uint32_t samples = g_audio[ch].samples;
     if (!samples || !buf_addr) return;
 
+    if (vol_l < 0) vol_l = 0;
+    if (vol_l > 32768) vol_l = 32768;
+    if (vol_r < 0) vol_r = 0;
+    if (vol_r > 32768) vol_r = 32768;
+
     int channels = (g_audio[ch].format == 0x10) ? 1 : 2;
     uint32_t bytes = samples * (uint32_t)channels * sizeof(int16_t);
 
+    /* Find an available buffer slot, or wait for the hardware to finish playing one */
     int slot = -1;
-    for (int i = 0; i < HOST_AUDIO_BUFFERS; i++) {
-        int idx = (g_host_audio[ch].next_buf + i) % HOST_AUDIO_BUFFERS;
-        WAVEHDR *h = &g_host_audio[ch].headers[idx];
-        if (!(h->dwFlags & WHDR_PREPARED) || (h->dwFlags & WHDR_DONE)) {
-            slot = idx;
-            break;
+    for (int retry = 0; retry < 50; retry++) {
+        for (int i = 0; i < HOST_AUDIO_BUFFERS; i++) {
+            int idx = (g_host_audio[ch].next_buf + i) % HOST_AUDIO_BUFFERS;
+            WAVEHDR *h = &g_host_audio[ch].headers[idx];
+            if (!(h->dwFlags & WHDR_PREPARED) || (h->dwFlags & WHDR_DONE)) {
+                slot = idx;
+                break;
+            }
+        }
+        if (slot >= 0) break;
+        if (g_host_audio[ch].hEvent) {
+            WaitForSingleObject(g_host_audio[ch].hEvent, 10);
+        } else {
+            Sleep(1);
         }
     }
 
     if (slot < 0) {
-        slot = g_host_audio[ch].next_buf;
+        /* Device busy or stalled: drop frame instead of corrupting active DMA headers */
+        return;
     }
 
     WAVEHDR *hdr = &g_host_audio[ch].headers[slot];
@@ -398,9 +424,7 @@ static void hle_OutputBlocking(void) {
         uint64_t now = host_now_us();
         if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
         g_audio_due_us[ch] += play_us;
-        if (host_now_us() + play_us < g_audio_due_us[ch]) {
-            psp_threadman_yield();
-        }
+        psp_threadman_yield();
     }
 #else
     psp_threadman_delay(play_us);
@@ -428,9 +452,7 @@ static void hle_OutputPannedBlocking(void) {
         uint64_t now = host_now_us();
         if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
         g_audio_due_us[ch] += play_us;
-        if (host_now_us() + play_us < g_audio_due_us[ch]) {
-            psp_threadman_yield();
-        }
+        psp_threadman_yield();
     }
 #else
     psp_threadman_delay(play_us);

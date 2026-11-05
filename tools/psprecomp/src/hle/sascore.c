@@ -115,6 +115,7 @@ static int decode_block(sas_voice *v) {
 
     int shift  = hdr & 0x0F;
     int filter = (hdr >> 4) & 0x0F;
+    if (shift > 12) shift = 9;           /* Sony VAG spec: reserved 13..15 treat as 9 */
     if (filter > 4) filter = 0;          /* out of range: treat as no prediction */
 
     if (flags == 7) return 0;
@@ -127,7 +128,7 @@ static int decode_block(sas_voice *v) {
         /* Sign-extend the 4-bit sample into the top of a 16-bit word, then
          * shift down. Shifting the nibble directly loses the sign. */
         int s = (int)((int16_t)(nib << 12)) >> shift;
-        s += (VAG_F0[filter] * v->hist1 + VAG_F1[filter] * v->hist2) >> 6;
+        s += (VAG_F0[filter] * v->hist1 + VAG_F1[filter] * v->hist2 + 32) >> 6;
         s = clamp16(s);
 
         v->decoded[i] = (int16_t)s;
@@ -255,8 +256,14 @@ static void hle_SetVolume(void) {
     /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends. */
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
-    v->vol_l = (int32_t)psp_arg(2);
-    v->vol_r = (int32_t)psp_arg(3);
+    int32_t l = (int32_t)psp_arg(2);
+    int32_t r = (int32_t)psp_arg(3);
+    if (l > 0x1000) l = 0x1000;
+    if (l < -0x1000) l = -0x1000;
+    if (r > 0x1000) r = 0x1000;
+    if (r < -0x1000) r = -0x1000;
+    v->vol_l = l;
+    v->vol_r = r;
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
