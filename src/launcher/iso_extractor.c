@@ -329,6 +329,49 @@ bool iso_verify_full(const char *iso_path, IsoVerificationResult *out_res, iso_p
     return out_res->is_persona_usa;
 }
 
+/* Security validation to prevent Zip-Slip / Path Traversal attacks from crafted ISOs */
+static bool is_safe_filename(const char *name) {
+    if (!name || !name[0]) return false;
+
+    /* Reject exact "." or ".." */
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+
+    /* Reject any components containing ".." traversal sequences */
+    if (strstr(name, "..") != NULL) return false;
+
+    /* Reject path separators, drive specifiers, and forbidden Windows characters */
+    for (const char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 32 || c == 127 ||
+            c == '/' || c == '\\' || c == ':' ||
+            c == '*' || c == '?' || c == '"' ||
+            c == '<' || c == '>' || c == '|') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_path_inside_dir(const char *target_path, const char *base_dir) {
+    char canonical_base[MAX_PATH];
+    char canonical_target[MAX_PATH];
+
+    if (!GetFullPathNameA(base_dir, MAX_PATH, canonical_base, NULL)) return false;
+    if (!GetFullPathNameA(target_path, MAX_PATH, canonical_target, NULL)) return false;
+
+    size_t base_len = strlen(canonical_base);
+    while (base_len > 0 && (canonical_base[base_len - 1] == '\\' || canonical_base[base_len - 1] == '/')) {
+        canonical_base[--base_len] = '\0';
+    }
+
+    if (_strnicmp(canonical_target, canonical_base, base_len) != 0) return false;
+
+    char next = canonical_target[base_len];
+    if (next != '\\' && next != '/' && next != '\0') return false;
+
+    return true;
+}
+
 /* Recursive ISO directory extraction */
 static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size, const char *dest_dir,
                             uint64_t *extracted_bytes, uint64_t total_est, iso_progress_cb cb) {
@@ -364,8 +407,22 @@ static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size, const 
         char *semi = strchr(name, ';');
         if (semi) *semi = '\0';
 
+        /* Security Check: Validate filename against path traversal and forbidden characters */
+        if (!is_safe_filename(name)) {
+            fprintf(stderr, "[SECURITY] Skipped unsafe ISO filename entry: '%s'\n", name);
+            off += rec->length;
+            continue;
+        }
+
         char sub_dest[MAX_PATH];
         snprintf(sub_dest, sizeof(sub_dest), "%s/%s", dest_dir, name);
+
+        /* Security Check: Ensure canonical resolved path stays strictly inside destination directory */
+        if (!is_path_inside_dir(sub_dest, dest_dir)) {
+            fprintf(stderr, "[SECURITY] Blocked path traversal attempt: '%s'\n", sub_dest);
+            off += rec->length;
+            continue;
+        }
 
         if (rec->flags & 0x02) {
             /* Subdirectory */
