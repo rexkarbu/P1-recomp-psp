@@ -68,6 +68,18 @@ bool file_exists(const char *path) {
     return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
+/* Safely remove a file, removing any read-only flags first */
+void safe_remove_file(const char *path) {
+    if (!path || !path[0]) return;
+    DWORD attr = GetFileAttributesA(path);
+    if (attr != INVALID_FILE_ATTRIBUTES) {
+        if (attr & FILE_ATTRIBUTE_READONLY) {
+            SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL);
+        }
+        DeleteFileA(path);
+    }
+}
+
 static void ensure_dir(const char *path) {
     char tmp[MAX_PATH];
     snprintf(tmp, sizeof(tmp), "%s", path);
@@ -85,11 +97,12 @@ static void ensure_dir(const char *path) {
 }
 
 bool iso_is_game_installed(void) {
-    /* Required core files for Shin Megami Tensei: Persona */
+    /* Required core files and verified manifest for Shin Megami Tensei: Persona */
+    bool has_manifest = file_exists("install_manifest.txt");
     bool has_datapack = file_exists("game_root/disc/PSP_GAME/USRDIR/datapack.bin");
     bool has_eboot    = file_exists("extracted/EBOOT_RELOC.ELF");
     bool has_exe      = file_exists("persona_pc.exe") || file_exists("build_pc/persona_pc.exe");
-    return has_datapack && has_eboot && has_exe;
+    return has_manifest && has_datapack && has_eboot && has_exe;
 }
 
 bool iso_verify(const char *iso_path, char *out_disc_id, char *out_title, uint64_t *out_size) {
@@ -434,20 +447,31 @@ static bool is_path_inside_dir(const char *target_path, const char *base_dir) {
 
 /* Recursive ISO directory extraction */
 static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size, const char *dest_dir,
-                            uint64_t *extracted_bytes, uint64_t total_est, uint64_t iso_size, iso_progress_cb cb) {
-    if (!dir_lba || !dir_size || dir_size > 64 * 1024 * 1024) return;
+                            uint64_t *extracted_bytes, uint64_t total_est, uint64_t iso_size,
+                            uint32_t *out_errors, iso_progress_cb cb) {
+    if (!dir_lba || !dir_size || dir_size > 64 * 1024 * 1024) {
+        if (out_errors) (*out_errors)++;
+        return;
+    }
 
     /* Bounds check: verify directory extent is within physical ISO size */
-    if ((uint64_t)dir_lba * 2048ull + dir_size > iso_size) return;
+    if ((uint64_t)dir_lba * 2048ull + dir_size > iso_size) {
+        if (out_errors) (*out_errors)++;
+        return;
+    }
 
     ensure_dir(dest_dir);
 
     uint8_t *buf = (uint8_t *)malloc(dir_size);
-    if (!buf) return;
+    if (!buf) {
+        if (out_errors) (*out_errors)++;
+        return;
+    }
 
     if (_fseeki64(f, (int64_t)dir_lba * 2048ll, SEEK_SET) != 0 ||
         fread(buf, 1, dir_size, f) != dir_size) {
         free(buf);
+        if (out_errors) (*out_errors)++;
         return;
     }
 
@@ -506,25 +530,40 @@ static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size, const 
         uint64_t extent_end = (uint64_t)rec->extent_le * 2048ull + (uint64_t)rec->size_le;
         if (extent_end > iso_size) {
             fprintf(stderr, "[SECURITY] Extent beyond ISO bounds: '%s' (LBA=%u, size=%u)\n", name, rec->extent_le, rec->size_le);
+            if (out_errors) (*out_errors)++;
             off += rec->length;
             continue;
         }
 
         if (rec->flags & 0x02) {
             /* Subdirectory */
-            extract_iso_dir(f, rec->extent_le, rec->size_le, sub_dest, extracted_bytes, total_est, iso_size, cb);
+            extract_iso_dir(f, rec->extent_le, rec->size_le, sub_dest, extracted_bytes, total_est, iso_size, out_errors, cb);
         } else {
-            /* Regular File */
+            /* Regular File: ensure any existing destination file is writable (strip read-only from ISO) */
+            DWORD attr = GetFileAttributesA(sub_dest);
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY)) {
+                SetFileAttributesA(sub_dest, FILE_ATTRIBUTE_NORMAL);
+            }
             FILE *out_f = fopen(sub_dest, "wb");
-            if (out_f) {
+            if (!out_f) {
+                fprintf(stderr, "[ERROR] Failed to open destination file for write: '%s'\n", sub_dest);
+                if (out_errors) (*out_errors)++;
+            } else {
                 if (_fseeki64(f, (int64_t)rec->extent_le * 2048ll, SEEK_SET) == 0) {
                     uint32_t remain = rec->size_le;
                     uint8_t chunk[65536];
                     while (remain > 0) {
                         uint32_t take = (remain > sizeof(chunk)) ? (uint32_t)sizeof(chunk) : remain;
                         size_t r = fread(chunk, 1, take, f);
-                        if (r == 0) break;
-                        fwrite(chunk, 1, r, out_f);
+                        if (r == 0) {
+                            if (out_errors) (*out_errors)++;
+                            break;
+                        }
+                        size_t w = fwrite(chunk, 1, r, out_f);
+                        if (w != r) {
+                            if (out_errors) (*out_errors)++;
+                            break;
+                        }
                         remain -= (uint32_t)r;
                         *extracted_bytes += r;
 
@@ -536,6 +575,11 @@ static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size, const 
                             cb(pct, msg);
                         }
                     }
+                    if (remain > 0 && out_errors) {
+                        (*out_errors)++;
+                    }
+                } else {
+                    if (out_errors) (*out_errors)++;
                 }
                 fclose(out_f);
             }
@@ -692,13 +736,51 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
 
     FILE *out_f = fopen(out_path, "wb");
     if (!out_f) { free(data); return 3; }
-    fwrite(data, 1, fsize, out_f);
+    size_t written = fwrite(data, 1, fsize, out_f);
     fclose(out_f);
     free(data);
+    if (written != (size_t)fsize) {
+        DeleteFileA(out_path);
+        return 3;
+    }
     return 0;
 }
 
+/* Validate that an ELF file exists, meets minimum size, and has \x7F ELF magic */
+bool validate_elf_file(const char *path, size_t min_size) {
+    if (!file_exists(path)) return false;
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    if (_fseeki64(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return false;
+    }
+    int64_t sz = _ftelli64(f);
+    if (sz < (int64_t)min_size) {
+        fclose(f);
+        return false;
+    }
+    if (_fseeki64(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+    uint8_t magic[4];
+    if (fread(magic, 1, 4, f) != 4) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    return (memcmp(magic, "\x7F" "ELF", 4) == 0);
+}
+
 bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
+    /* Step 1: Purge stale artifacts from prior runs so partial results cannot masquerade as success */
+    if (cb) cb(2.0f, "Purging stale installation artifacts...");
+    safe_remove_file("install_manifest.txt");
+    safe_remove_file("extracted/EBOOT.BIN");
+    safe_remove_file("extracted/EBOOT.ELF");
+    safe_remove_file("extracted/EBOOT_RELOC.ELF");
+
     if (cb) cb(5.0f, "Verifying ISO integrity and disc identifier...");
 
     char disc_id[16] = {0};
@@ -793,59 +875,122 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
     /* Extract entire PSP_GAME directory tree to game_root/disc/PSP_GAME */
     if (cb) cb(15.0f, "Extracting game assets to game_root/disc/PSP_GAME...");
     uint64_t extracted_bytes = 0;
-    extract_iso_dir(f, psp_game_lba, psp_game_size, "game_root/disc/PSP_GAME", &extracted_bytes, iso_size, iso_size, cb);
+    uint32_t extract_errors = 0;
+    extract_iso_dir(f, psp_game_lba, psp_game_size, "game_root/disc/PSP_GAME", &extracted_bytes, iso_size, iso_size, &extract_errors, cb);
     fclose(f);
+
+    if (extract_errors > 0) {
+        if (cb) cb(0.0f, "Extraction failed! Encountered write errors or corrupted sectors.");
+        return false;
+    }
+
+    /* Verify essential extracted files exist */
+    if (!file_exists("game_root/disc/PSP_GAME/USRDIR/datapack.bin")) {
+        if (cb) cb(0.0f, "Extraction validation failed: USRDIR/datapack.bin is missing.");
+        return false;
+    }
+    if (!file_exists("game_root/disc/PSP_GAME/SYSDIR/EBOOT.BIN")) {
+        if (cb) cb(0.0f, "Extraction validation failed: SYSDIR/EBOOT.BIN is missing.");
+        return false;
+    }
 
     /* Also copy EBOOT.BIN to extracted/EBOOT.BIN for decryption */
     if (cb) cb(68.0f, "Copying EBOOT.BIN for Kirk decryption...");
-    CopyFileA("game_root/disc/PSP_GAME/SYSDIR/EBOOT.BIN", "extracted/EBOOT.BIN", FALSE);
+    safe_remove_file("extracted/EBOOT.BIN");
+    if (!CopyFileA("game_root/disc/PSP_GAME/SYSDIR/EBOOT.BIN", "extracted/EBOOT.BIN", FALSE)) {
+        if (cb) cb(0.0f, "Failed to copy EBOOT.BIN for decryption (CopyFileA error).");
+        return false;
+    }
+    SetFileAttributesA("extracted/EBOOT.BIN", FILE_ATTRIBUTE_NORMAL);
 
     /* Find pspdecrypt.exe binary */
     const char *pspdec = NULL;
     if (file_exists("tools/pspdecrypt-bin/pspdecrypt.exe")) pspdec = "tools\\pspdecrypt-bin\\pspdecrypt.exe";
     else if (file_exists("tools/pspdecrypt.exe"))          pspdec = "tools\\pspdecrypt.exe";
     else if (file_exists("pspdecrypt.exe"))                pspdec = "pspdecrypt.exe";
-    else                                                   pspdec = "tools\\pspdecrypt-bin\\pspdecrypt.exe";
+
+    if (!pspdec) {
+        if (cb) cb(0.0f, "Decryption engine tool (pspdecrypt.exe) not found.");
+        return false;
+    }
 
     /* Decrypt EBOOT.BIN using pspdecrypt engine */
     if (cb) cb(75.0f, "Decrypting PSP binary with Kirk crypto engine...");
+    safe_remove_file("extracted/EBOOT.ELF");
     char cmd_buf[512];
-    snprintf(cmd_buf, sizeof(cmd_buf), "%s -o extracted\\EBOOT.ELF extracted\\EBOOT.BIN", pspdec);
+    snprintf(cmd_buf, sizeof(cmd_buf), "\"%s\" -o extracted\\EBOOT.ELF extracted\\EBOOT.BIN", pspdec);
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
     si.dwFlags |= STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
-    if (CreateProcessA(NULL, cmd_buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 15000); /* wait up to 15s */
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    if (!CreateProcessA(NULL, cmd_buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        safe_remove_file("extracted/EBOOT.ELF");
+        if (cb) cb(0.0f, "Failed to launch decryption process (CreateProcess error).");
+        return false;
     }
 
-    if (!file_exists("extracted/EBOOT.ELF")) {
-        if (cb) cb(0.0f, "Decryption failed! extracted/EBOOT.ELF was not created.");
+    DWORD wait_res = WaitForSingleObject(pi.hProcess, 30000); /* wait up to 30s */
+    if (wait_res == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        safe_remove_file("extracted/EBOOT.ELF");
+        if (cb) cb(0.0f, "Decryption process timed out after 30 seconds.");
+        return false;
+    }
+
+    DWORD exit_code = 1;
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code) || exit_code != 0) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        safe_remove_file("extracted/EBOOT.ELF");
+        if (cb) cb(0.0f, "Decryption engine failed (non-zero exit code or error).");
+        return false;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    /* Validate decrypted ELF binary */
+    if (!validate_elf_file("extracted/EBOOT.ELF", 1024)) {
+        safe_remove_file("extracted/EBOOT.ELF");
+        if (cb) cb(0.0f, "Decryption failed! extracted/EBOOT.ELF is invalid or corrupted.");
         return false;
     }
 
     /* Relocate PRX segments to create EBOOT_RELOC.ELF */
     if (cb) cb(88.0f, "Relocating PRX segments to generate EBOOT_RELOC.ELF...");
+    safe_remove_file("extracted/EBOOT_RELOC.ELF");
     int reloc_res = prx_relocate_file("extracted/EBOOT.ELF", "extracted/EBOOT_RELOC.ELF");
     if (reloc_res != 0) {
+        safe_remove_file("extracted/EBOOT_RELOC.ELF");
         if (cb) cb(0.0f, "PRX Relocation failed!");
         return false;
     }
 
-    /* Step 4: Write installation manifest to persist state */
+    if (!validate_elf_file("extracted/EBOOT_RELOC.ELF", 1024)) {
+        safe_remove_file("extracted/EBOOT_RELOC.ELF");
+        if (cb) cb(0.0f, "Relocated binary validation failed: EBOOT_RELOC.ELF is corrupted.");
+        return false;
+    }
+
+    /* Step 4: Write installation manifest ONLY after all outputs are validated */
     if (cb) cb(96.0f, "Saving installation manifest and linking game assets...");
     FILE *f_manifest = fopen("install_manifest.txt", "w");
-    if (f_manifest) {
-        fprintf(f_manifest, "[INSTALL_MANIFEST]\n");
-        fprintf(f_manifest, "game_title=Shin Megami Tensei: Persona (USA)\n");
-        fprintf(f_manifest, "disc_id=%s\n", disc_id);
-        fprintf(f_manifest, "iso_source=%s\n", iso_path);
-        fprintf(f_manifest, "status=INSTALLED_READY\n");
-        fclose(f_manifest);
+    if (!f_manifest) {
+        if (cb) cb(0.0f, "Failed to write install_manifest.txt.");
+        return false;
+    }
+    fprintf(f_manifest, "[INSTALL_MANIFEST]\n");
+    fprintf(f_manifest, "game_title=Shin Megami Tensei: Persona (USA)\n");
+    fprintf(f_manifest, "disc_id=%s\n", disc_id);
+    fprintf(f_manifest, "iso_source=%s\n", iso_path);
+    fprintf(f_manifest, "status=INSTALLED_READY\n");
+    if (fclose(f_manifest) != 0) {
+        safe_remove_file("install_manifest.txt");
+        if (cb) cb(0.0f, "Failed to flush install_manifest.txt to disk.");
+        return false;
     }
 
     if (cb) cb(100.0f, "Installation Complete! Persona 1 is ready to play!");

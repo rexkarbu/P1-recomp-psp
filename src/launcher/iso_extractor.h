@@ -30,6 +30,9 @@ typedef struct {
 /* Mengecek apakah file ada di disk */
 bool file_exists(const char *path);
 
+/* Menghapus file secara aman (melepas atribut read-only terlebih dahulu) */
+void safe_remove_file(const char *path);
+
 /* Mengecek apakah aset game dan binary sudah terpasang lengkap */
 bool iso_is_game_installed(void);
 
@@ -47,6 +50,9 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb progress_cb);
 
 /* Relokasi PRX internal */
 int prx_relocate_file(const char *in_path, const char *out_path);
+
+/* Memvalidasi integritas file ELF (magic header dan ukuran minimum) */
+bool validate_elf_file(const char *path, size_t min_size);
 
 #ifdef __cplusplus
 }
