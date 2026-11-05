@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +54,16 @@ int prx_relocate_file(const char *in_path, const char *out_path);
 
 /* Memvalidasi integritas file ELF (magic header dan ukuran minimum) */
 bool validate_elf_file(const char *path, size_t min_size);
+
+/* Security validation to prevent Zip-Slip / Path Traversal attacks from crafted ISOs */
+bool is_safe_filename(const char *name);
+bool is_path_inside_dir(const char *target_path, const char *base_dir);
+
+/* Recursive ISO directory extraction with bounds and extent checking */
+void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size,
+                     const char *dest_dir, uint64_t *extracted_bytes,
+                     uint64_t total_est, uint64_t iso_size,
+                     uint32_t *out_errors, iso_progress_cb cb);
 
 #ifdef __cplusplus
 }

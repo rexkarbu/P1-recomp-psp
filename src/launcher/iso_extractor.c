@@ -8,8 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <wincrypt.h>
 #include <windows.h>
+#include <wincrypt.h>
 
 #pragma pack(push, 1)
 typedef struct {
@@ -96,6 +96,60 @@ static void ensure_dir(const char *path) {
     }
   }
   CreateDirectoryA(tmp, NULL);
+}
+
+static void recursive_delete_dir(const char *dir) {
+  char search_path[MAX_PATH];
+  snprintf(search_path, sizeof(search_path), "%s/*", dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE hFind = FindFirstFileA(search_path, &fd);
+  if (hFind == INVALID_HANDLE_VALUE) {
+    RemoveDirectoryA(dir);
+    return;
+  }
+  do {
+    if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+      continue;
+    char sub_path[MAX_PATH];
+    snprintf(sub_path, sizeof(sub_path), "%s/%s", dir, fd.cFileName);
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      recursive_delete_dir(sub_path);
+    } else {
+      SetFileAttributesA(sub_path, FILE_ATTRIBUTE_NORMAL);
+      DeleteFileA(sub_path);
+    }
+  } while (FindNextFileA(hFind, &fd));
+  FindClose(hFind);
+  RemoveDirectoryA(dir);
+}
+
+static bool recursive_copy_dir(const char *src_dir, const char *dst_dir) {
+  ensure_dir(dst_dir);
+  char search_path[MAX_PATH];
+  snprintf(search_path, sizeof(search_path), "%s/*", src_dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE hFind = FindFirstFileA(search_path, &fd);
+  if (hFind == INVALID_HANDLE_VALUE)
+    return true;
+  bool ok = true;
+  do {
+    if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+      continue;
+    char src_sub[MAX_PATH];
+    char dst_sub[MAX_PATH];
+    snprintf(src_sub, sizeof(src_sub), "%s/%s", src_dir, fd.cFileName);
+    snprintf(dst_sub, sizeof(dst_sub), "%s/%s", dst_dir, fd.cFileName);
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      if (!recursive_copy_dir(src_sub, dst_sub))
+        ok = false;
+    } else {
+      SetFileAttributesA(dst_sub, FILE_ATTRIBUTE_NORMAL);
+      if (!CopyFileA(src_sub, dst_sub, FALSE))
+        ok = false;
+    }
+  } while (FindNextFileA(hFind, &fd));
+  FindClose(hFind);
+  return ok;
 }
 
 bool iso_is_game_installed(void) {
@@ -457,7 +511,7 @@ bool iso_verify_full(const char *iso_path, IsoVerificationResult *out_res,
 
 /* Security validation to prevent Zip-Slip / Path Traversal attacks from crafted
  * ISOs */
-static bool is_safe_filename(const char *name) {
+bool is_safe_filename(const char *name) {
   if (!name || !name[0])
     return false;
 
@@ -481,7 +535,7 @@ static bool is_safe_filename(const char *name) {
   return true;
 }
 
-static bool is_path_inside_dir(const char *target_path, const char *base_dir) {
+bool is_path_inside_dir(const char *target_path, const char *base_dir) {
   char canonical_base[MAX_PATH];
   char canonical_target[MAX_PATH];
 
@@ -506,11 +560,11 @@ static bool is_path_inside_dir(const char *target_path, const char *base_dir) {
   return true;
 }
 
-/* Recursive ISO directory extraction */
-static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size,
-                            const char *dest_dir, uint64_t *extracted_bytes,
-                            uint64_t total_est, uint64_t iso_size,
-                            uint32_t *out_errors, iso_progress_cb cb) {
+/* Recursive ISO directory extraction with bounds and extent checking */
+void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size,
+                     const char *dest_dir, uint64_t *extracted_bytes,
+                     uint64_t total_est, uint64_t iso_size,
+                     uint32_t *out_errors, iso_progress_cb cb) {
   if (!dir_lba || !dir_size || dir_size > 64 * 1024 * 1024) {
     if (out_errors)
       (*out_errors)++;
@@ -553,10 +607,14 @@ static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size,
     }
 
     if (rec->length < sizeof(ISO_DirRecord) || off + rec->length > dir_size) {
+      if (out_errors)
+        (*out_errors)++;
       break; /* Malformed record boundary */
     }
 
     if (sizeof(ISO_DirRecord) + rec->name_len > rec->length) {
+      if (out_errors)
+        (*out_errors)++;
       off += rec->length;
       continue; /* Malformed name length */
     }
@@ -583,6 +641,8 @@ static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size,
     if (!is_safe_filename(name)) {
       fprintf(stderr, "[SECURITY] Skipped unsafe ISO filename entry: '%s'\n",
               name);
+      if (out_errors)
+        (*out_errors)++;
       off += rec->length;
       continue;
     }
@@ -595,6 +655,8 @@ static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size,
     if (!is_path_inside_dir(sub_dest, dest_dir)) {
       fprintf(stderr, "[SECURITY] Blocked path traversal attempt: '%s'\n",
               sub_dest);
+      if (out_errors)
+        (*out_errors)++;
       off += rec->length;
       continue;
     }
@@ -721,6 +783,11 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
   long fsize = ftell(f);
   rewind(f);
 
+  if (fsize < 52) {
+    fclose(f);
+    return 2;
+  }
+
   uint8_t *data = (uint8_t *)malloc(fsize);
   if (!data || fread(data, 1, fsize, f) != (size_t)fsize) {
     fclose(f);
@@ -730,10 +797,7 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
   }
   fclose(f);
 
-  if (memcmp(data,
-             "\x7F"
-             "ELF",
-             4) != 0) {
+  if (memcmp(data, "\x7F" "ELF", 4) != 0 || data[4] != 1 || data[5] != 1) {
     free(data);
     return 2;
   }
@@ -746,13 +810,37 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
   uint16_t shentsize = rd16(data + 46);
   uint16_t shnum = rd16(data + 48);
 
+  /* Validate Program Header Table bounds */
+  if (phnum > 0) {
+    if (phentsize < 32 || phoff < 52 ||
+        (uint64_t)phoff + (uint64_t)phnum * phentsize > (uint64_t)fsize) {
+      free(data);
+      return 2;
+    }
+  }
+
+  /* Validate Section Header Table bounds */
+  if (shnum > 0) {
+    if (shentsize < 40 || shoff < 52 ||
+        (uint64_t)shoff + (uint64_t)shnum * shentsize > (uint64_t)fsize) {
+      free(data);
+      return 2;
+    }
+  }
+
   uint32_t seg_base[8] = {0};
   uint32_t seg_offset[8] = {0};
   int nseg = 0;
   for (int i = 0; i < phnum && nseg < 8; i++) {
     uint8_t *ph = data + phoff + (i * phentsize);
     if (rd32(ph + 0) == 1) { /* PT_LOAD */
-      seg_offset[nseg] = rd32(ph + 4);
+      uint32_t p_offset = rd32(ph + 4);
+      uint32_t p_filesz = rd32(ph + 16);
+      if ((uint64_t)p_offset + p_filesz > (uint64_t)fsize) {
+        free(data);
+        return 2;
+      }
+      seg_offset[nseg] = p_offset;
       seg_base[nseg] = rd32(ph + 8);
       nseg++;
     }
@@ -769,8 +857,12 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
 
     uint32_t rel_off = rd32(sh + 16);
     uint32_t rel_size = rd32(sh + 20);
-    int num_entries = rel_size / 8;
+    if ((uint64_t)rel_off + rel_size > (uint64_t)fsize || (rel_size % 8) != 0) {
+      free(data);
+      return 2; /* Corrupted section extent */
+    }
 
+    int num_entries = rel_size / 8;
     for (int i = 0; i < num_entries; i++) {
       uint8_t *rel = data + rel_off + (i * 8);
       uint32_t r_offset = rd32(rel + 0);
@@ -779,6 +871,13 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
       int type = ELF32_R_TYPE(r_info);
       int ofs_base = ELF32_R_OFS_BASE(r_info);
       int addr_base = ELF32_R_ADDR_BASE(r_info);
+
+      /* Validate segment indices */
+      if (ofs_base < 0 || ofs_base >= nseg || addr_base < 0 || addr_base >= nseg) {
+        free(data);
+        return 2; /* Corrupted segment index */
+      }
+
       uint32_t delta = seg_base[addr_base];
 
       if (type == R_MIPS_HI16) {
@@ -793,6 +892,10 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
 
       if (type == R_MIPS_LO16) {
         uint32_t lo_target = r_offset + seg_offset[ofs_base];
+        if ((uint64_t)lo_target + 4 > (uint64_t)fsize) {
+          free(data);
+          return 2; /* Out of bounds write target */
+        }
         uint32_t lo_inst = rd32(data + lo_target);
         int16_t lo_imm = (int16_t)(lo_inst & 0xFFFF);
 
@@ -800,6 +903,10 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
           for (int h = 0; h < hi_count; h++) {
             uint32_t hi_target =
                 hi_queue[h].r_offset + seg_offset[hi_queue[h].ofs_base];
+            if ((uint64_t)hi_target + 4 > (uint64_t)fsize) {
+              free(data);
+              return 2; /* Out of bounds write target */
+            }
             uint32_t hi_inst = rd32(data + hi_target);
             uint16_t hi_imm = (uint16_t)(hi_inst & 0xFFFF);
             uint32_t h_delta = seg_base[hi_queue[h].addr_base];
@@ -828,6 +935,10 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
         continue;
 
       uint32_t target = r_offset + seg_offset[ofs_base];
+      if ((uint64_t)target + 4 > (uint64_t)fsize) {
+        free(data);
+        return 2; /* Out of bounds write target */
+      }
       uint32_t inst = rd32(data + target);
 
       if (type == R_MIPS_32) {
@@ -856,8 +967,8 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
   return 0;
 }
 
-/* Validate that an ELF file exists, meets minimum size, and has \x7F ELF magic
- */
+/* Comprehensive ELF file validation: checks magic, 32-bit little endian,
+ * header size, and all program/section header table bounds */
 bool validate_elf_file(const char *path, size_t min_size) {
   if (!file_exists(path))
     return false;
@@ -869,7 +980,7 @@ bool validate_elf_file(const char *path, size_t min_size) {
     return false;
   }
   int64_t sz = _ftelli64(f);
-  if (sz < (int64_t)min_size) {
+  if (sz < (int64_t)min_size || sz < 52 || sz > 512 * 1024 * 1024) {
     fclose(f);
     return false;
   }
@@ -877,28 +988,110 @@ bool validate_elf_file(const char *path, size_t min_size) {
     fclose(f);
     return false;
   }
-  uint8_t magic[4];
-  if (fread(magic, 1, 4, f) != 4) {
+
+  uint8_t ehdr[52];
+  if (fread(ehdr, 1, 52, f) != 52) {
     fclose(f);
     return false;
   }
+
+  /* Check ELF magic: \x7F ELF */
+  if (memcmp(ehdr, "\x7F" "ELF", 4) != 0) {
+    fclose(f);
+    return false;
+  }
+
+  /* Check 32-bit (ELFCLASS32=1) and Little Endian (ELFDATA2LSB=1) */
+  if (ehdr[4] != 1 || ehdr[5] != 1) {
+    fclose(f);
+    return false;
+  }
+
+  uint32_t phoff = rd32(ehdr + 28);
+  uint32_t shoff = rd32(ehdr + 32);
+  uint16_t ehsize = rd16(ehdr + 40);
+  uint16_t phentsize = rd16(ehdr + 42);
+  uint16_t phnum = rd16(ehdr + 44);
+  uint16_t shentsize = rd16(ehdr + 46);
+  uint16_t shnum = rd16(ehdr + 48);
+
+  if (ehsize < 52) {
+    fclose(f);
+    return false;
+  }
+
+  /* Validate Program Header Table bounds */
+  if (phnum > 0) {
+    if (phentsize < 32 || phoff < 52) {
+      fclose(f);
+      return false;
+    }
+    uint64_t ph_end = (uint64_t)phoff + (uint64_t)phnum * phentsize;
+    if (ph_end > (uint64_t)sz) {
+      fclose(f);
+      return false;
+    }
+
+    /* Validate each Program Header entry */
+    for (uint16_t i = 0; i < phnum; i++) {
+      if (_fseeki64(f, (int64_t)phoff + (int64_t)i * phentsize, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+      }
+      uint8_t ph[32];
+      if (fread(ph, 1, 32, f) != 32) {
+        fclose(f);
+        return false;
+      }
+      uint32_t p_offset = rd32(ph + 4);
+      uint32_t p_filesz = rd32(ph + 16);
+      if ((uint64_t)p_offset + p_filesz > (uint64_t)sz) {
+        fclose(f);
+        return false;
+      }
+    }
+  }
+
+  /* Validate Section Header Table bounds */
+  if (shnum > 0) {
+    if (shentsize < 40 || shoff < 52) {
+      fclose(f);
+      return false;
+    }
+    uint64_t sh_end = (uint64_t)shoff + (uint64_t)shnum * shentsize;
+    if (sh_end > (uint64_t)sz) {
+      fclose(f);
+      return false;
+    }
+
+    /* Validate each Section Header entry */
+    for (uint16_t s = 0; s < shnum; s++) {
+      if (_fseeki64(f, (int64_t)shoff + (int64_t)s * shentsize, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+      }
+      uint8_t sh[40];
+      if (fread(sh, 1, 40, f) != 40) {
+        fclose(f);
+        return false;
+      }
+      uint32_t sh_type = rd32(sh + 4);
+      uint32_t s_offset = rd32(sh + 16);
+      uint32_t s_size = rd32(sh + 20);
+      if (sh_type != 8 /* SHT_NOBITS */ &&
+          (uint64_t)s_offset + s_size > (uint64_t)sz) {
+        fclose(f);
+        return false;
+      }
+    }
+  }
+
   fclose(f);
-  return (memcmp(magic,
-                 "\x7F"
-                 "ELF",
-                 4) == 0);
+  return true;
 }
 
 bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
-  /* Step 1: Purge stale artifacts from prior runs so partial results cannot
-   * masquerade as success */
-  if (cb)
-    cb(2.0f, "Purging stale installation artifacts...");
-  safe_remove_file("install_manifest.txt");
-  safe_remove_file("extracted/EBOOT.BIN");
-  safe_remove_file("extracted/EBOOT.ELF");
-  safe_remove_file("extracted/EBOOT_RELOC.ELF");
-
+  /* STEP 1: Verify ISO integrity and disc identifier BEFORE touching existing files */
   if (cb)
     cb(5.0f, "Verifying ISO integrity and disc identifier...");
 
@@ -911,16 +1104,21 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
     return false;
   }
 
-  if (cb)
-    cb(10.0f, "Preparing destination folders...");
-  ensure_dir("game_root/disc/PSP_GAME");
-  ensure_dir("extracted");
+  /* STEP 2: Setup fresh isolated staging directories */
+  const char *staging_root = "staging_install";
+  const char *staging_disc = "staging_install/game_root/disc/PSP_GAME";
+  const char *staging_extracted = "staging_install/extracted";
+
+  recursive_delete_dir(staging_root);
+  ensure_dir(staging_disc);
+  ensure_dir(staging_extracted);
   ensure_dir("savedata");
   ensure_dir("screenshots");
   ensure_dir("states");
 
   FILE *f = fopen(iso_path, "rb");
   if (!f) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Failed to open ISO file for extraction.");
     return false;
@@ -929,6 +1127,7 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
   /* Locate PSP_GAME on ISO */
   if (_fseeki64(f, 16ll * 2048ll, SEEK_SET) != 0) {
     fclose(f);
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Failed to seek to ISO Volume Descriptor.");
     return false;
@@ -938,6 +1137,7 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
   if (fread(&pvd, 1, sizeof(pvd), f) != sizeof(pvd) ||
       memcmp(pvd.id, "CD001", 5) != 0) {
     fclose(f);
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Invalid ISO Volume Descriptor.");
     return false;
@@ -948,6 +1148,7 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
       root->size_le > 64 * 1024 * 1024 ||
       (uint64_t)root->extent_le * 2048ull + root->size_le > iso_size) {
     fclose(f);
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Corrupted root directory in ISO.");
     return false;
@@ -956,12 +1157,14 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
   uint8_t *root_buf = (uint8_t *)malloc(root->size_le);
   if (!root_buf) {
     fclose(f);
+    recursive_delete_dir(staging_root);
     return false;
   }
   if (_fseeki64(f, (int64_t)root->extent_le * 2048ll, SEEK_SET) != 0 ||
       fread(root_buf, 1, root->size_le, f) != root->size_le) {
     free(root_buf);
     fclose(f);
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Failed reading root directory records.");
     return false;
@@ -1003,50 +1206,56 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
 
   if (!psp_game_lba || !psp_game_size) {
     fclose(f);
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Error: PSP_GAME directory missing or out of bounds.");
     return false;
   }
 
-  /* Extract entire PSP_GAME directory tree to game_root/disc/PSP_GAME */
+  /* Extract entire PSP_GAME directory tree to staging_disc */
   if (cb)
-    cb(15.0f, "Extracting game assets to game_root/disc/PSP_GAME...");
+    cb(15.0f, "Extracting game assets to staging area...");
   uint64_t extracted_bytes = 0;
   uint32_t extract_errors = 0;
-  extract_iso_dir(f, psp_game_lba, psp_game_size, "game_root/disc/PSP_GAME",
+  extract_iso_dir(f, psp_game_lba, psp_game_size, staging_disc,
                   &extracted_bytes, iso_size, iso_size, &extract_errors, cb);
   fclose(f);
 
   if (extract_errors > 0) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f,
-         "Extraction failed! Encountered write errors or corrupted sectors.");
+         "Extraction failed! Encountered malformed records, write errors, or "
+         "corrupted sectors.");
     return false;
   }
 
-  /* Verify essential extracted files exist */
-  if (!file_exists("game_root/disc/PSP_GAME/USRDIR/datapack.bin")) {
+  /* Verify essential extracted files in staging */
+  if (!file_exists("staging_install/game_root/disc/PSP_GAME/USRDIR/datapack.bin")) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Extraction validation failed: USRDIR/datapack.bin is missing.");
     return false;
   }
-  if (!file_exists("game_root/disc/PSP_GAME/SYSDIR/EBOOT.BIN")) {
+  if (!file_exists("staging_install/game_root/disc/PSP_GAME/SYSDIR/EBOOT.BIN")) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Extraction validation failed: SYSDIR/EBOOT.BIN is missing.");
     return false;
   }
 
-  /* Also copy EBOOT.BIN to extracted/EBOOT.BIN for decryption */
+  /* Copy EBOOT.BIN to staging_install/extracted/EBOOT.BIN for decryption */
   if (cb)
     cb(68.0f, "Copying EBOOT.BIN for Kirk decryption...");
-  safe_remove_file("extracted/EBOOT.BIN");
-  if (!CopyFileA("game_root/disc/PSP_GAME/SYSDIR/EBOOT.BIN",
-                 "extracted/EBOOT.BIN", FALSE)) {
+  if (!CopyFileA("staging_install/game_root/disc/PSP_GAME/SYSDIR/EBOOT.BIN",
+                 "staging_install/extracted/EBOOT.BIN", FALSE)) {
+    recursive_delete_dir(staging_root);
     if (cb)
-      cb(0.0f, "Failed to copy EBOOT.BIN for decryption (CopyFileA error).");
+      cb(0.0f, "Failed to copy EBOOT.BIN for decryption.");
     return false;
   }
-  SetFileAttributesA("extracted/EBOOT.BIN", FILE_ATTRIBUTE_NORMAL);
+  SetFileAttributesA("staging_install/extracted/EBOOT.BIN",
+                     FILE_ATTRIBUTE_NORMAL);
 
   /* Find pspdecrypt.exe binary */
   const char *pspdec = NULL;
@@ -1058,18 +1267,20 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
     pspdec = "pspdecrypt.exe";
 
   if (!pspdec) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Decryption engine tool (pspdecrypt.exe) not found.");
     return false;
   }
 
-  /* Decrypt EBOOT.BIN using pspdecrypt engine */
+  /* Decrypt EBOOT.BIN using pspdecrypt engine in staging */
   if (cb)
     cb(75.0f, "Decrypting PSP binary with Kirk crypto engine...");
-  safe_remove_file("extracted/EBOOT.ELF");
   char cmd_buf[512];
   snprintf(cmd_buf, sizeof(cmd_buf),
-           "\"%s\" -o extracted\\EBOOT.ELF extracted\\EBOOT.BIN", pspdec);
+           "\"%s\" -o staging_install\\extracted\\EBOOT.ELF "
+           "staging_install\\extracted\\EBOOT.BIN",
+           pspdec);
 
   STARTUPINFOA si = {sizeof(si)};
   PROCESS_INFORMATION pi = {0};
@@ -1078,7 +1289,7 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
 
   if (!CreateProcessA(NULL, cmd_buf, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL,
                       NULL, &si, &pi)) {
-    safe_remove_file("extracted/EBOOT.ELF");
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Failed to launch decryption process (CreateProcess error).");
     return false;
@@ -1089,7 +1300,7 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
     TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    safe_remove_file("extracted/EBOOT.ELF");
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Decryption process timed out after 30 seconds.");
     return false;
@@ -1099,7 +1310,7 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
   if (!GetExitCodeProcess(pi.hProcess, &exit_code) || exit_code != 0) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    safe_remove_file("extracted/EBOOT.ELF");
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Decryption engine failed (non-zero exit code or error).");
     return false;
@@ -1107,41 +1318,67 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
 
-  /* Validate decrypted ELF binary */
-  if (!validate_elf_file("extracted/EBOOT.ELF", 1024)) {
-    safe_remove_file("extracted/EBOOT.ELF");
+  /* Validate decrypted ELF binary in staging */
+  if (!validate_elf_file("staging_install/extracted/EBOOT.ELF", 1024)) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f,
-         "Decryption failed! extracted/EBOOT.ELF is invalid or corrupted.");
+         "Decryption failed! staging EBOOT.ELF is invalid or corrupted.");
     return false;
   }
 
-  /* Relocate PRX segments to create EBOOT_RELOC.ELF */
+  /* Relocate PRX segments to create EBOOT_RELOC.ELF in staging */
   if (cb)
     cb(88.0f, "Relocating PRX segments to generate EBOOT_RELOC.ELF...");
-  safe_remove_file("extracted/EBOOT_RELOC.ELF");
   int reloc_res =
-      prx_relocate_file("extracted/EBOOT.ELF", "extracted/EBOOT_RELOC.ELF");
+      prx_relocate_file("staging_install/extracted/EBOOT.ELF",
+                        "staging_install/extracted/EBOOT_RELOC.ELF");
   if (reloc_res != 0) {
-    safe_remove_file("extracted/EBOOT_RELOC.ELF");
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "PRX Relocation failed!");
     return false;
   }
 
-  if (!validate_elf_file("extracted/EBOOT_RELOC.ELF", 1024)) {
-    safe_remove_file("extracted/EBOOT_RELOC.ELF");
+  if (!validate_elf_file("staging_install/extracted/EBOOT_RELOC.ELF", 1024)) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f,
          "Relocated binary validation failed: EBOOT_RELOC.ELF is corrupted.");
     return false;
   }
 
-  /* Step 4: Write installation manifest ONLY after all outputs are validated */
+  /* STEP 3: All outputs in staging are 100% validated! Commit/Swap to production! */
   if (cb)
-    cb(96.0f, "Saving installation manifest and linking game assets...");
+    cb(94.0f, "Publishing validated game assets to installation directory...");
+
+  ensure_dir("game_root/disc/PSP_GAME");
+  ensure_dir("extracted");
+
+  if (!recursive_copy_dir(staging_disc, "game_root/disc/PSP_GAME")) {
+    recursive_delete_dir(staging_root);
+    if (cb)
+      cb(0.0f, "Failed to copy staged game assets to game_root.");
+    return false;
+  }
+
+  CopyFileA("staging_install/extracted/EBOOT.BIN", "extracted/EBOOT.BIN", FALSE);
+  CopyFileA("staging_install/extracted/EBOOT.ELF", "extracted/EBOOT.ELF", FALSE);
+  if (!CopyFileA("staging_install/extracted/EBOOT_RELOC.ELF",
+                 "extracted/EBOOT_RELOC.ELF", FALSE)) {
+    recursive_delete_dir(staging_root);
+    if (cb)
+      cb(0.0f,
+         "Failed to copy validated EBOOT_RELOC.ELF to extracted/ folder.");
+    return false;
+  }
+
+  /* Step 4: Write installation manifest ONLY after all outputs are validated and published */
+  if (cb)
+    cb(98.0f, "Saving installation manifest and linking game assets...");
   FILE *f_manifest = fopen("install_manifest.txt", "w");
   if (!f_manifest) {
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Failed to write install_manifest.txt.");
     return false;
@@ -1153,10 +1390,14 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
   fprintf(f_manifest, "status=INSTALLED_READY\n");
   if (fclose(f_manifest) != 0) {
     safe_remove_file("install_manifest.txt");
+    recursive_delete_dir(staging_root);
     if (cb)
       cb(0.0f, "Failed to flush install_manifest.txt to disk.");
     return false;
   }
+
+  /* Clean up staging directory */
+  recursive_delete_dir(staging_root);
 
   if (cb)
     cb(100.0f, "Installation Complete! Persona 1 is ready to play!");

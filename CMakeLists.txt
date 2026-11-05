@@ -44,3 +44,41 @@ target_link_libraries(persona_launcher PRIVATE
     user32
     advapi32
 )
+
+# --- Unit Test Targets ---
+add_executable(test_path_traversal_prevention
+    tests/test_path_traversal_prevention.c
+    src/launcher/iso_extractor.c
+)
+target_include_directories(test_path_traversal_prevention PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/launcher
+)
+target_link_libraries(test_path_traversal_prevention PRIVATE
+    advapi32
+)
+
+add_executable(test_iso_bounds_checking
+    tests/test_iso_bounds_checking.c
+    src/launcher/iso_extractor.c
+)
+target_include_directories(test_iso_bounds_checking PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/launcher
+)
+target_link_libraries(test_iso_bounds_checking PRIVATE
+    advapi32
+)
+
+add_executable(test_stale_artifact_prevention
+    tests/test_stale_artifact_prevention.c
+    src/launcher/iso_extractor.c
+)
+target_include_directories(test_stale_artifact_prevention PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/launcher
+)
+target_link_libraries(test_stale_artifact_prevention PRIVATE
+    advapi32
+)
+
+add_executable(test_launcher_mgmt
+    tests/test_launcher_mgmt.c
+)

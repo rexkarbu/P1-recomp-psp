@@ -4,49 +4,7 @@
 #include <string.h>
 #include <windows.h>
 #include <assert.h>
-
-/* Mirroring the security validation logic from iso_extractor.c */
-static bool is_safe_filename(const char *name) {
-    if (!name || !name[0]) return false;
-
-    /* Reject exact "." or ".." */
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
-
-    /* Reject any components containing ".." traversal sequences */
-    if (strstr(name, "..") != NULL) return false;
-
-    /* Reject path separators, drive specifiers, and forbidden Windows characters */
-    for (const char *p = name; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c < 32 || c == 127 ||
-            c == '/' || c == '\\' || c == ':' ||
-            c == '*' || c == '?' || c == '"' ||
-            c == '<' || c == '>' || c == '|') {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool is_path_inside_dir(const char *target_path, const char *base_dir) {
-    char canonical_base[MAX_PATH];
-    char canonical_target[MAX_PATH];
-
-    if (!GetFullPathNameA(base_dir, MAX_PATH, canonical_base, NULL)) return false;
-    if (!GetFullPathNameA(target_path, MAX_PATH, canonical_target, NULL)) return false;
-
-    size_t base_len = strlen(canonical_base);
-    while (base_len > 0 && (canonical_base[base_len - 1] == '\\' || canonical_base[base_len - 1] == '/')) {
-        canonical_base[--base_len] = '\0';
-    }
-
-    if (_strnicmp(canonical_target, canonical_base, base_len) != 0) return false;
-
-    char next = canonical_target[base_len];
-    if (next != '\\' && next != '/' && next != '\0') return false;
-
-    return true;
-}
+#include "iso_extractor.h"
 
 int main(void) {
     printf("=================================================================\n");
