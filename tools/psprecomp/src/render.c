@@ -310,28 +310,53 @@ static int depth_pass(int func, int z, int d) {
     }
 }
 
+static inline uint32_t fast_fb_read(const uint8_t *p, int fmt) {
+    if (fmt == 3) return *(const uint32_t *)p;
+    return psp_color_expand(*(const uint16_t *)p, fmt);
+}
+
+static inline void fast_fb_write(uint8_t *p, uint32_t c, int fmt) {
+    if (fmt == 3) *(uint32_t *)p = c;
+    else *(uint16_t *)p = (uint16_t)color_pack(c, fmt);
+}
+
 /* One fragment through the pipeline. `c` is the interpolated vertex colour,
  * `zf` its depth. */
-static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u, float v, float zf) {
+static inline void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u, float v, float zf) {
     if (!g_fb_addr || !g_fb_stride) return;
     if (x < 0 || y < 0 || x >= 480 || y >= 272) return;
     if (x < st->sc_x0 || x > st->sc_x1 || y < st->sc_y0 || y > st->sc_y1) return;
 
     const uint32_t bytes = g_fb_fmt == 3 ? 4u : 2u;
-    const uint32_t at = g_fb_addr + (uint32_t)(y * (int)g_fb_stride + x) * bytes;
-    /* Rounded: coplanar layers (WTF draws LED text on its panel at the same
-     * depth) must compare equal, and interpolation lands either side of it. */
+    const uint32_t offset = (uint32_t)(y * (int)g_fb_stride + x) * bytes;
+    uint8_t *fb_ptr = NULL;
+    if (psp_mem.vram && g_fb_addr >= PSP_VRAM_BASE &&
+        (g_fb_addr - PSP_VRAM_BASE) + offset + bytes <= PSP_VRAM_SIZE) {
+        fb_ptr = psp_mem.vram + (g_fb_addr - PSP_VRAM_BASE) + offset;
+    }
+
     const int z = zf < 0.0f ? 0 : (zf > 65535.0f ? 65535 : (int)(zf + 0.5f));
-    const uint32_t zat = st->zaddr + (uint32_t)(y * st->zbw + x) * 2u;
     const int have_z = st->zaddr && st->zbw > 0;
+    const uint32_t zoffset = (uint32_t)(y * st->zbw + x) * 2u;
+    uint16_t *z_ptr = NULL;
+    if (have_z && psp_mem.vram && st->zaddr >= PSP_VRAM_BASE &&
+        (st->zaddr - PSP_VRAM_BASE) + zoffset + 2u <= PSP_VRAM_SIZE) {
+        z_ptr = (uint16_t *)(psp_mem.vram + (st->zaddr - PSP_VRAM_BASE) + zoffset);
+    }
+
+    const uint32_t at = g_fb_addr + offset;
+    const uint32_t zat = st->zaddr + zoffset;
 
     if (st->clear) {
         /* Clear mode writes only the buffers its flags name. A depth-only
          * clear leaves the colour alone. */
-        if (st->clear_depth && have_z) psp_write16(zat, (uint16_t)z);
+        if (st->clear_depth && have_z) {
+            if (z_ptr) *z_ptr = (uint16_t)z;
+            else psp_write16(zat, (uint16_t)z);
+        }
         if (!st->clear_color && !st->clear_alpha) return;
         if (!st->clear_color || !st->clear_alpha) {
-            uint32_t d = fb_read(at);
+            uint32_t d = fb_ptr ? fast_fb_read(fb_ptr, g_fb_fmt) : fb_read(at);
             c = st->clear_color ? (c & 0x00FFFFFFu) | (d & 0xFF000000u)
                                 : (d & 0x00FFFFFFu) | (c & 0xFF000000u);
         }
@@ -344,19 +369,26 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
         }
         if (st->atest && !alpha_pass(st, c)) return;
         if (st->ztest && have_z) {
-            if (!depth_pass(st->zfunc, z, psp_read16(zat))) return;
-            if (st->zwrite) psp_write16(zat, (uint16_t)z);
+            uint16_t cur_z = z_ptr ? *z_ptr : psp_read16(zat);
+            if (!depth_pass(st->zfunc, z, cur_z)) return;
+            if (st->zwrite) {
+                if (z_ptr) *z_ptr = (uint16_t)z;
+                else psp_write16(zat, (uint16_t)z);
+            }
         }
-        if (st->blend) c = blend(st, c, fb_read(at));
+        if (st->blend) {
+            uint32_t d = fb_ptr ? fast_fb_read(fb_ptr, g_fb_fmt) : fb_read(at);
+            c = blend(st, c, d);
+        }
     }
 
-    if (bytes == 4) psp_write32(at, c);
-    else            psp_write16(at, (uint16_t)color_pack(c, g_fb_fmt));
+    if (fb_ptr) {
+        fast_fb_write(fb_ptr, c, g_fb_fmt);
+    } else {
+        if (bytes == 4) psp_write32(at, c);
+        else            psp_write16(at, (uint16_t)color_pack(c, g_fb_fmt));
+    }
     g_pixels++;
-}
-
-static int edge(const psp_vertex *p, const psp_vertex *q, int x, int y) {
-    return (q->x - p->x) * (y - p->y) - (q->y - p->y) * (x - p->x);
 }
 
 /* Barycentric fill with integer edge functions, so a shared edge belongs to
@@ -377,6 +409,17 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     if (maxx > 479) maxx = 479;
     if (maxy > 271) maxy = 271;
 
+    /* Scissor rectangle clip */
+    if (st->sc_x1 >= st->sc_x0) {
+        if (minx < st->sc_x0) minx = st->sc_x0;
+        if (maxx > st->sc_x1) maxx = st->sc_x1;
+    }
+    if (st->sc_y1 >= st->sc_y0) {
+        if (miny < st->sc_y0) miny = st->sc_y0;
+        if (maxy > st->sc_y1) maxy = st->sc_y1;
+    }
+    if (minx > maxx || miny > maxy) return;
+
     const float ax = (float)a->x, ay = (float)a->y;
     const float bx = (float)b->x, by = (float)b->y;
     const float cx = (float)c->x, cy = (float)c->y;
@@ -384,38 +427,62 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     if (area == 0.0f) return;
     const float inv = 1.0f / area;
 
+    /* Incremental steps for barycentric edge functions */
+    const float dw0_dx = -(by - ay);
+    const float dw0_dy = (bx - ax);
+    const float dw1_dx = -(cy - by);
+    const float dw1_dy = (cx - bx);
+    const float dw2_dx = -(ay - cy);
+    const float dw2_dy = (ax - cx);
+
+    const float start_fx = (float)minx + 0.5f;
+    const float start_fy = (float)miny + 0.5f;
+
+    float w0_row = (bx - ax) * (start_fy - ay) - (by - ay) * (start_fx - ax);
+    float w1_row = (cx - bx) * (start_fy - by) - (cy - by) * (start_fx - bx);
+    float w2_row = (ax - cx) * (start_fy - cy) - (ay - cy) * (start_fx - cx);
+
     for (int y = miny; y <= maxy; y++) {
-        const float fy = (float)y + 0.5f;
+        float w0 = w0_row;
+        float w1 = w1_row;
+        float w2 = w2_row;
+
         for (int x = minx; x <= maxx; x++) {
-            const float fx = (float)x + 0.5f;
-            float w0 = (bx - ax) * (fy - ay) - (by - ay) * (fx - ax);   /* weight of c */
-            float w1 = (cx - bx) * (fy - by) - (cy - by) * (fx - bx);   /* weight of a */
-            float w2 = (ax - cx) * (fy - cy) - (ay - cy) * (fx - cx);   /* weight of b */
+            if ((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) || (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f)) {
+                float la = w1 * inv;
+                float lb = w2 * inv;
+                float lc = w0 * inv;
+                if (la < 0.0f) la = 0.0f;
+                if (lb < 0.0f) lb = 0.0f;
+                if (lc < 0.0f) lc = 0.0f;
+                const float sum = la + lb + lc;
+                if (sum > 0.0f) {
+                    const float inv_sum = 1.0f / sum;
+                    la *= inv_sum;
+                    lb *= inv_sum;
+                    lc *= inv_sum;
+                }
 
-            if (!((w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) || (w0 <= 0.0f && w1 <= 0.0f && w2 <= 0.0f)))
-                continue;
-
-            float la = w1 * inv;
-            float lb = w2 * inv;
-            float lc = w0 * inv;
-            if (la < 0.0f) la = 0.0f;
-            if (lb < 0.0f) lb = 0.0f;
-            if (lc < 0.0f) lc = 0.0f;
-            const float sum = la + lb + lc;
-            if (sum > 0.0f) { la /= sum; lb /= sum; lc /= sum; }
-
-            uint32_t col = c->rgba;
-            if (st->gouraud) {
-                col = rgba((int)(R(a->rgba) * la + R(b->rgba) * lb + R(c->rgba) * lc + 0.5f),
-                           (int)(G(a->rgba) * la + G(b->rgba) * lb + G(c->rgba) * lc + 0.5f),
-                           (int)(B(a->rgba) * la + B(b->rgba) * lb + B(c->rgba) * lc + 0.5f),
-                           (int)(A(a->rgba) * la + A(b->rgba) * lb + A(c->rgba) * lc + 0.5f));
+                uint32_t col = c->rgba;
+                if (st->gouraud) {
+                    col = rgba((int)(R(a->rgba) * la + R(b->rgba) * lb + R(c->rgba) * lc + 0.5f),
+                               (int)(G(a->rgba) * la + G(b->rgba) * lb + G(c->rgba) * lc + 0.5f),
+                               (int)(B(a->rgba) * la + B(b->rgba) * lb + B(c->rgba) * lc + 0.5f),
+                               (int)(A(a->rgba) * la + A(b->rgba) * lb + A(c->rgba) * lc + 0.5f));
+                }
+                fragment(st, x, y, col,
+                         a->u * la + b->u * lb + c->u * lc,
+                         a->v * la + b->v * lb + c->v * lc,
+                         a->z * la + b->z * lb + c->z * lc);
             }
-            fragment(st, x, y, col,
-                     a->u * la + b->u * lb + c->u * lc,
-                     a->v * la + b->v * lb + c->v * lc,
-                     a->z * la + b->z * lb + c->z * lc);
+            w0 += dw0_dx;
+            w1 += dw1_dx;
+            w2 += dw2_dx;
         }
+
+        w0_row += dw0_dy;
+        w1_row += dw1_dy;
+        w2_row += dw2_dy;
     }
 }
 

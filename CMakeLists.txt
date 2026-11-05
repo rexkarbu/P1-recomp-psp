@@ -4,7 +4,7 @@ project(persona_pc C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-add_compile_options(-O1 -foptimize-sibling-calls -w)
+add_compile_options(-O2 -foptimize-sibling-calls -fomit-frame-pointer -w)
 add_compile_definitions(PSPRECOMP_REAL_THREADS=1)
 
 file(GLOB RECOMP_SRCS CONFIGURE_DEPENDS "recomp_src/*.c")
