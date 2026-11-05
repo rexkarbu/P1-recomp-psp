@@ -98,14 +98,24 @@ bool iso_verify(const char *iso_path, char *out_disc_id, char *out_title, uint64
     FILE *f = fopen(iso_path, "rb");
     if (!f) return false;
 
-    if (out_size) {
-        _fseeki64(f, 0, SEEK_END);
-        *out_size = (uint64_t)_ftelli64(f);
-        _fseeki64(f, 0, SEEK_SET);
+    _fseeki64(f, 0, SEEK_END);
+    uint64_t file_size = (uint64_t)_ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+
+    if (out_size) *out_size = file_size;
+
+    /* A valid ISO must have at least 17 sectors (PVD is at sector 16) */
+    if (file_size < 17ull * 2048ull) {
+        fclose(f);
+        return false;
     }
 
     /* Read PVD at Sector 16 (0x8000) */
-    fseek(f, 16 * 2048, SEEK_SET);
+    if (_fseeki64(f, 16ll * 2048ll, SEEK_SET) != 0) {
+        fclose(f);
+        return false;
+    }
+
     ISO_PVD pvd;
     if (fread(&pvd, 1, sizeof(pvd), f) != sizeof(pvd)) {
         fclose(f);
@@ -118,24 +128,50 @@ bool iso_verify(const char *iso_path, char *out_disc_id, char *out_title, uint64
     }
 
     ISO_DirRecord *root = (ISO_DirRecord *)pvd.root_directory_record;
-    if (root->extent_le == 0 || root->size_le == 0) {
+    if (root->extent_le == 0 || root->size_le == 0 || root->size_le > 64 * 1024 * 1024) {
+        fclose(f);
+        return false;
+    }
+
+    /* Bounds Check: verify root extent is strictly inside file bounds */
+    if ((uint64_t)root->extent_le * 2048ull + root->size_le > file_size) {
         fclose(f);
         return false;
     }
 
     uint8_t *root_buf = (uint8_t *)malloc(root->size_le);
     if (!root_buf) { fclose(f); return false; }
-    fseek(f, (long)root->extent_le * 2048, SEEK_SET);
-    fread(root_buf, 1, root->size_le, f);
+    if (_fseeki64(f, (int64_t)root->extent_le * 2048ll, SEEK_SET) != 0 ||
+        fread(root_buf, 1, root->size_le, f) != root->size_le) {
+        free(root_buf);
+        fclose(f);
+        return false;
+    }
 
     uint32_t psp_game_lba = 0, psp_game_size = 0;
     uint32_t off = 0;
-    while (off < root->size_le) {
+    while (off + sizeof(ISO_DirRecord) <= root->size_le) {
         ISO_DirRecord *rec = (ISO_DirRecord *)(root_buf + off);
-        if (rec->length == 0) { off = (off + 2047) & ~2047; continue; }
+        if (rec->length == 0) {
+            uint32_t next = (off + 2047) & ~2047;
+            if (next <= off) break;
+            off = next;
+            continue;
+        }
+        if (rec->length < sizeof(ISO_DirRecord) || off + rec->length > root->size_le) {
+            break; /* Malformed record boundary */
+        }
+        if (sizeof(ISO_DirRecord) + rec->name_len > rec->length) {
+            off += rec->length;
+            continue; /* Malformed name length */
+        }
+
         if (rec->name_len >= 8 && memcmp(root_buf + off + sizeof(ISO_DirRecord), "PSP_GAME", 8) == 0) {
-            psp_game_lba = rec->extent_le;
-            psp_game_size = rec->size_le;
+            uint64_t extent_end = (uint64_t)rec->extent_le * 2048ull + (uint64_t)rec->size_le;
+            if (extent_end <= file_size && rec->size_le <= 64 * 1024 * 1024) {
+                psp_game_lba = rec->extent_le;
+                psp_game_size = rec->size_le;
+            }
             break;
         }
         off += rec->length;
@@ -150,17 +186,37 @@ bool iso_verify(const char *iso_path, char *out_disc_id, char *out_title, uint64
     /* Read PSP_GAME directory */
     uint8_t *psp_buf = (uint8_t *)malloc(psp_game_size);
     if (!psp_buf) { fclose(f); return false; }
-    fseek(f, (long)psp_game_lba * 2048, SEEK_SET);
-    fread(psp_buf, 1, psp_game_size, f);
+    if (_fseeki64(f, (int64_t)psp_game_lba * 2048ll, SEEK_SET) != 0 ||
+        fread(psp_buf, 1, psp_game_size, f) != psp_game_size) {
+        free(psp_buf);
+        fclose(f);
+        return false;
+    }
 
     uint32_t sfo_lba = 0, sfo_size = 0;
     off = 0;
-    while (off < psp_game_size) {
+    while (off + sizeof(ISO_DirRecord) <= psp_game_size) {
         ISO_DirRecord *rec = (ISO_DirRecord *)(psp_buf + off);
-        if (rec->length == 0) { off = (off + 2047) & ~2047; continue; }
+        if (rec->length == 0) {
+            uint32_t next = (off + 2047) & ~2047;
+            if (next <= off) break;
+            off = next;
+            continue;
+        }
+        if (rec->length < sizeof(ISO_DirRecord) || off + rec->length > psp_game_size) {
+            break; /* Malformed record boundary */
+        }
+        if (sizeof(ISO_DirRecord) + rec->name_len > rec->length) {
+            off += rec->length;
+            continue; /* Malformed name length */
+        }
+
         if (rec->name_len >= 9 && memcmp(psp_buf + off + sizeof(ISO_DirRecord), "PARAM.SFO", 9) == 0) {
-            sfo_lba = rec->extent_le;
-            sfo_size = rec->size_le;
+            uint64_t extent_end = (uint64_t)rec->extent_le * 2048ull + (uint64_t)rec->size_le;
+            if (extent_end <= file_size && rec->size_le <= 4 * 1024 * 1024) {
+                sfo_lba = rec->extent_le;
+                sfo_size = rec->size_le;
+            }
             break;
         }
         off += rec->length;
@@ -175,8 +231,12 @@ bool iso_verify(const char *iso_path, char *out_disc_id, char *out_title, uint64
     /* Read PARAM.SFO to extract DISC ID & Title */
     uint8_t *sfo = (uint8_t *)malloc(sfo_size);
     if (!sfo) { fclose(f); return false; }
-    fseek(f, (long)sfo_lba * 2048, SEEK_SET);
-    fread(sfo, 1, sfo_size, f);
+    if (_fseeki64(f, (int64_t)sfo_lba * 2048ll, SEEK_SET) != 0 ||
+        fread(sfo, 1, sfo_size, f) != sfo_size) {
+        free(sfo);
+        fclose(f);
+        return false;
+    }
     fclose(f);
 
     bool is_persona_usa = false;
@@ -374,22 +434,40 @@ static bool is_path_inside_dir(const char *target_path, const char *base_dir) {
 
 /* Recursive ISO directory extraction */
 static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size, const char *dest_dir,
-                            uint64_t *extracted_bytes, uint64_t total_est, iso_progress_cb cb) {
-    if (!dir_lba || !dir_size) return;
+                            uint64_t *extracted_bytes, uint64_t total_est, uint64_t iso_size, iso_progress_cb cb) {
+    if (!dir_lba || !dir_size || dir_size > 64 * 1024 * 1024) return;
+
+    /* Bounds check: verify directory extent is within physical ISO size */
+    if ((uint64_t)dir_lba * 2048ull + dir_size > iso_size) return;
+
     ensure_dir(dest_dir);
 
     uint8_t *buf = (uint8_t *)malloc(dir_size);
     if (!buf) return;
 
-    _fseeki64(f, (int64_t)dir_lba * 2048ll, SEEK_SET);
-    fread(buf, 1, dir_size, f);
+    if (_fseeki64(f, (int64_t)dir_lba * 2048ll, SEEK_SET) != 0 ||
+        fread(buf, 1, dir_size, f) != dir_size) {
+        free(buf);
+        return;
+    }
 
     uint32_t off = 0;
-    while (off < dir_size) {
+    while (off + sizeof(ISO_DirRecord) <= dir_size) {
         ISO_DirRecord *rec = (ISO_DirRecord *)(buf + off);
         if (rec->length == 0) {
-            off = (off + 2047) & ~2047;
+            uint32_t next = (off + 2047) & ~2047;
+            if (next <= off) break;
+            off = next;
             continue;
+        }
+
+        if (rec->length < sizeof(ISO_DirRecord) || off + rec->length > dir_size) {
+            break; /* Malformed record boundary */
+        }
+
+        if (sizeof(ISO_DirRecord) + rec->name_len > rec->length) {
+            off += rec->length;
+            continue; /* Malformed name length */
         }
 
         uint8_t *raw_name = buf + off + sizeof(ISO_DirRecord);
@@ -424,30 +502,39 @@ static void extract_iso_dir(FILE *f, uint32_t dir_lba, uint32_t dir_size, const 
             continue;
         }
 
+        /* Bounds check: verify file/directory extent is within physical ISO size */
+        uint64_t extent_end = (uint64_t)rec->extent_le * 2048ull + (uint64_t)rec->size_le;
+        if (extent_end > iso_size) {
+            fprintf(stderr, "[SECURITY] Extent beyond ISO bounds: '%s' (LBA=%u, size=%u)\n", name, rec->extent_le, rec->size_le);
+            off += rec->length;
+            continue;
+        }
+
         if (rec->flags & 0x02) {
             /* Subdirectory */
-            extract_iso_dir(f, rec->extent_le, rec->size_le, sub_dest, extracted_bytes, total_est, cb);
+            extract_iso_dir(f, rec->extent_le, rec->size_le, sub_dest, extracted_bytes, total_est, iso_size, cb);
         } else {
             /* Regular File */
             FILE *out_f = fopen(sub_dest, "wb");
             if (out_f) {
-                _fseeki64(f, (int64_t)rec->extent_le * 2048ll, SEEK_SET);
-                uint32_t remain = rec->size_le;
-                uint8_t chunk[65536];
-                while (remain > 0) {
-                    uint32_t take = (remain > sizeof(chunk)) ? (uint32_t)sizeof(chunk) : remain;
-                    size_t r = fread(chunk, 1, take, f);
-                    if (r == 0) break;
-                    fwrite(chunk, 1, r, out_f);
-                    remain -= (uint32_t)r;
-                    *extracted_bytes += r;
+                if (_fseeki64(f, (int64_t)rec->extent_le * 2048ll, SEEK_SET) == 0) {
+                    uint32_t remain = rec->size_le;
+                    uint8_t chunk[65536];
+                    while (remain > 0) {
+                        uint32_t take = (remain > sizeof(chunk)) ? (uint32_t)sizeof(chunk) : remain;
+                        size_t r = fread(chunk, 1, take, f);
+                        if (r == 0) break;
+                        fwrite(chunk, 1, r, out_f);
+                        remain -= (uint32_t)r;
+                        *extracted_bytes += r;
 
-                    if (cb && total_est > 0) {
-                        float pct = (float)(*extracted_bytes) / (float)total_est * 65.0f;
-                        if (pct > 65.0f) pct = 65.0f;
-                        char msg[128];
-                        snprintf(msg, sizeof(msg), "Extracting: %s (%.1f MB)", name, (float)(*extracted_bytes) / (1024.0f * 1024.0f));
-                        cb(pct, msg);
+                        if (cb && total_est > 0) {
+                            float pct = (float)(*extracted_bytes) / (float)total_est * 65.0f;
+                            if (pct > 65.0f) pct = 65.0f;
+                            char msg[128];
+                            snprintf(msg, sizeof(msg), "Extracting: %s (%.1f MB)", name, (float)(*extracted_bytes) / (1024.0f * 1024.0f));
+                            cb(pct, msg);
+                        }
                     }
                 }
                 fclose(out_f);
@@ -636,39 +723,77 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
     }
 
     /* Locate PSP_GAME on ISO */
-    fseek(f, 16 * 2048, SEEK_SET);
+    if (_fseeki64(f, 16ll * 2048ll, SEEK_SET) != 0) {
+        fclose(f);
+        if (cb) cb(0.0f, "Failed to seek to ISO Volume Descriptor.");
+        return false;
+    }
+
     ISO_PVD pvd;
-    fread(&pvd, 1, sizeof(pvd), f);
+    if (fread(&pvd, 1, sizeof(pvd), f) != sizeof(pvd) || memcmp(pvd.id, "CD001", 5) != 0) {
+        fclose(f);
+        if (cb) cb(0.0f, "Invalid ISO Volume Descriptor.");
+        return false;
+    }
+
     ISO_DirRecord *root = (ISO_DirRecord *)pvd.root_directory_record;
+    if (root->extent_le == 0 || root->size_le == 0 || root->size_le > 64 * 1024 * 1024 ||
+        (uint64_t)root->extent_le * 2048ull + root->size_le > iso_size) {
+        fclose(f);
+        if (cb) cb(0.0f, "Corrupted root directory in ISO.");
+        return false;
+    }
 
     uint8_t *root_buf = (uint8_t *)malloc(root->size_le);
-    fseek(f, (long)root->extent_le * 2048, SEEK_SET);
-    fread(root_buf, 1, root->size_le, f);
+    if (!root_buf) { fclose(f); return false; }
+    if (_fseeki64(f, (int64_t)root->extent_le * 2048ll, SEEK_SET) != 0 ||
+        fread(root_buf, 1, root->size_le, f) != root->size_le) {
+        free(root_buf);
+        fclose(f);
+        if (cb) cb(0.0f, "Failed reading root directory records.");
+        return false;
+    }
 
     uint32_t psp_game_lba = 0, psp_game_size = 0;
     uint32_t off = 0;
-    while (off < root->size_le) {
+    while (off + sizeof(ISO_DirRecord) <= root->size_le) {
         ISO_DirRecord *rec = (ISO_DirRecord *)(root_buf + off);
-        if (rec->length == 0) { off = (off + 2047) & ~2047; continue; }
+        if (rec->length == 0) {
+            uint32_t next = (off + 2047) & ~2047;
+            if (next <= off) break;
+            off = next;
+            continue;
+        }
+        if (rec->length < sizeof(ISO_DirRecord) || off + rec->length > root->size_le) {
+            break;
+        }
+        if (sizeof(ISO_DirRecord) + rec->name_len > rec->length) {
+            off += rec->length;
+            continue;
+        }
+
         if (rec->name_len >= 8 && memcmp(root_buf + off + sizeof(ISO_DirRecord), "PSP_GAME", 8) == 0) {
-            psp_game_lba = rec->extent_le;
-            psp_game_size = rec->size_le;
+            uint64_t extent_end = (uint64_t)rec->extent_le * 2048ull + (uint64_t)rec->size_le;
+            if (extent_end <= iso_size && rec->size_le <= 64 * 1024 * 1024) {
+                psp_game_lba = rec->extent_le;
+                psp_game_size = rec->size_le;
+            }
             break;
         }
         off += rec->length;
     }
     free(root_buf);
 
-    if (!psp_game_lba) {
+    if (!psp_game_lba || !psp_game_size) {
         fclose(f);
-        if (cb) cb(0.0f, "Error: PSP_GAME directory missing in ISO.");
+        if (cb) cb(0.0f, "Error: PSP_GAME directory missing or out of bounds.");
         return false;
     }
 
     /* Extract entire PSP_GAME directory tree to game_root/disc/PSP_GAME */
     if (cb) cb(15.0f, "Extracting game assets to game_root/disc/PSP_GAME...");
     uint64_t extracted_bytes = 0;
-    extract_iso_dir(f, psp_game_lba, psp_game_size, "game_root/disc/PSP_GAME", &extracted_bytes, iso_size, cb);
+    extract_iso_dir(f, psp_game_lba, psp_game_size, "game_root/disc/PSP_GAME", &extracted_bytes, iso_size, iso_size, cb);
     fclose(f);
 
     /* Also copy EBOOT.BIN to extracted/EBOOT.BIN for decryption */
