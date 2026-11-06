@@ -31,6 +31,9 @@ typedef struct {
 /* Mengecek apakah file ada di disk */
 bool file_exists(const char *path);
 
+/* Mengecek apakah direktori ada di disk */
+bool dir_exists(const char *path);
+
 /* Menghapus file secara aman (melepas atribut read-only terlebih dahulu) */
 void safe_remove_file(const char *path);
 

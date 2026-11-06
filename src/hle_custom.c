@@ -134,34 +134,9 @@ static void capture_target_buffer(uint64_t vbl, uint32_t addr, uint32_t stride, 
     }
 }
 
-static inline uint64_t get_host_perf_us(void) {
-    static LARGE_INTEGER freq;
-    LARGE_INTEGER now;
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&now);
-    return (uint64_t)(now.QuadPart / freq.QuadPart) * 1000000ull +
-           (uint64_t)(now.QuadPart % freq.QuadPart) * 1000000ull / (uint64_t)freq.QuadPart;
-}
-
 static void hle_DisplayWaitVblankStart(void) {
     psp_display_vblank_step();
     uint64_t vbl = psp_display_vblanks();
-
-    /* 60 FPS frame-pacing: lock each frame to ~16.667 ms real-time to eliminate stuttering */
-    static uint64_t s_target_frame_time = 0;
-    uint64_t now = get_host_perf_us();
-    if (s_target_frame_time == 0 || now > s_target_frame_time + 33334ull) {
-        s_target_frame_time = now + 16667ull;
-    } else {
-        s_target_frame_time += 16667ull;
-        now = get_host_perf_us();
-        if (s_target_frame_time > now) {
-            uint64_t wait_us = s_target_frame_time - now;
-            if (wait_us >= 1000ull) {
-                psp_threadman_delay(wait_us);
-            }
-        }
-    }
 
     if (vbl - g_vblank_last_report >= 60) {
         g_vblank_last_report = vbl;

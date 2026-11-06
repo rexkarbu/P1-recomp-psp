@@ -46,6 +46,9 @@ static bool check_dir_exists(const char *path) {
 }
 
 int main(void) {
+    if (!check_dir_exists("game_root") && check_dir_exists("../game_root")) {
+        SetCurrentDirectoryA("..");
+    }
     printf("=================================================================\n");
     printf("  UNIT TEST: Persona Launcher Management & Quick Settings\n");
     printf("=================================================================\n");

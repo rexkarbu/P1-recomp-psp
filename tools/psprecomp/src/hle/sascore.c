@@ -257,14 +257,8 @@ static void hle_SetVolume(void) {
     /* (sasCore, voice, l, r, el, er) -- the last two are the reverb sends. */
     sas_voice *v = voice_arg();
     if (!v) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
-    int32_t l = (int32_t)psp_arg(2);
-    int32_t r = (int32_t)psp_arg(3);
-    if (l > 0x1000) l = 0x1000;
-    if (l < -0x1000) l = -0x1000;
-    if (r > 0x1000) r = 0x1000;
-    if (r < -0x1000) r = -0x1000;
-    v->vol_l = l;
-    v->vol_r = r;
+    v->vol_l = (int32_t)psp_arg(2);
+    v->vol_r = (int32_t)psp_arg(3);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

@@ -69,6 +69,11 @@ bool file_exists(const char *path) {
           !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
+bool dir_exists(const char *path) {
+  DWORD attr = GetFileAttributesA(path);
+  return (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
 /* Safely remove a file, removing any read-only flags first */
 void safe_remove_file(const char *path) {
   if (!path || !path[0])
@@ -150,6 +155,45 @@ static bool recursive_copy_dir(const char *src_dir, const char *dst_dir) {
   } while (FindNextFileA(hFind, &fd));
   FindClose(hFind);
   return ok;
+}
+
+static bool move_or_copy_dir(const char *src, const char *dst) {
+  if (MoveFileA(src, dst))
+    return true;
+  if (recursive_copy_dir(src, dst)) {
+    recursive_delete_dir(src);
+    return true;
+  }
+  return false;
+}
+
+static void rollback_installation(const char *backup_root, bool had_disc,
+                                  bool had_extracted, bool had_manifest) {
+  if (dir_exists("game_root/disc/PSP_GAME"))
+    recursive_delete_dir("game_root/disc/PSP_GAME");
+  if (dir_exists("extracted"))
+    recursive_delete_dir("extracted");
+  safe_remove_file("install_manifest.txt");
+
+  char backup_path[MAX_PATH];
+  if (had_disc) {
+    snprintf(backup_path, sizeof(backup_path), "%s/PSP_GAME", backup_root);
+    ensure_dir("game_root/disc");
+    if (!MoveFileA(backup_path, "game_root/disc/PSP_GAME")) {
+      recursive_copy_dir(backup_path, "game_root/disc/PSP_GAME");
+    }
+  }
+  if (had_extracted) {
+    snprintf(backup_path, sizeof(backup_path), "%s/extracted", backup_root);
+    if (!MoveFileA(backup_path, "extracted")) {
+      recursive_copy_dir(backup_path, "extracted");
+    }
+  }
+  if (had_manifest) {
+    snprintf(backup_path, sizeof(backup_path), "%s/install_manifest.txt",
+             backup_root);
+    MoveFileA(backup_path, "install_manifest.txt");
+  }
 }
 
 bool iso_is_game_installed(void) {
@@ -830,6 +874,7 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
 
   uint32_t seg_base[8] = {0};
   uint32_t seg_offset[8] = {0};
+  uint32_t seg_filesz[8] = {0};
   int nseg = 0;
   for (int i = 0; i < phnum && nseg < 8; i++) {
     uint8_t *ph = data + phoff + (i * phentsize);
@@ -841,6 +886,7 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
         return 2;
       }
       seg_offset[nseg] = p_offset;
+      seg_filesz[nseg] = p_filesz;
       seg_base[nseg] = rd32(ph + 8);
       nseg++;
     }
@@ -878,6 +924,15 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
         return 2; /* Corrupted segment index */
       }
 
+      /* Validate relocation offset does not wrap and stays within segment and file */
+      uint64_t base_ofs = (uint64_t)seg_offset[ofs_base];
+      uint64_t target = base_ofs + (uint64_t)r_offset;
+      if ((uint64_t)r_offset + 4 > (uint64_t)seg_filesz[ofs_base] ||
+          target + 4 > (uint64_t)fsize) {
+        free(data);
+        return 2; /* Relocation target out of segment or file bounds */
+      }
+
       uint32_t delta = seg_base[addr_base];
 
       if (type == R_MIPS_HI16) {
@@ -891,23 +946,21 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
       }
 
       if (type == R_MIPS_LO16) {
-        uint32_t lo_target = r_offset + seg_offset[ofs_base];
-        if ((uint64_t)lo_target + 4 > (uint64_t)fsize) {
-          free(data);
-          return 2; /* Out of bounds write target */
-        }
-        uint32_t lo_inst = rd32(data + lo_target);
+        uint64_t lo_target = target;
+        uint32_t lo_inst = rd32(data + (size_t)lo_target);
         int16_t lo_imm = (int16_t)(lo_inst & 0xFFFF);
 
         if (hi_count > 0) {
           for (int h = 0; h < hi_count; h++) {
-            uint32_t hi_target =
-                hi_queue[h].r_offset + seg_offset[hi_queue[h].ofs_base];
-            if ((uint64_t)hi_target + 4 > (uint64_t)fsize) {
+            int h_ofs = hi_queue[h].ofs_base;
+            uint64_t hi_target =
+                (uint64_t)seg_offset[h_ofs] + (uint64_t)hi_queue[h].r_offset;
+            if ((uint64_t)hi_queue[h].r_offset + 4 > (uint64_t)seg_filesz[h_ofs] ||
+                hi_target + 4 > (uint64_t)fsize) {
               free(data);
-              return 2; /* Out of bounds write target */
+              return 2; /* Out of bounds write target in HI16 */
             }
-            uint32_t hi_inst = rd32(data + hi_target);
+            uint32_t hi_inst = rd32(data + (size_t)hi_target);
             uint16_t hi_imm = (uint16_t)(hi_inst & 0xFFFF);
             uint32_t h_delta = seg_base[hi_queue[h].addr_base];
 
@@ -917,7 +970,7 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
               uint16_t new_hi = (uint16_t)((full_addr >> 16) +
                                            ((full_addr & 0x8000) ? 1 : 0));
               hi_inst = (hi_inst & 0xFFFF0000u) | new_hi;
-              wr32(data + hi_target, hi_inst);
+              wr32(data + (size_t)hi_target, hi_inst);
             }
           }
           hi_count = 0;
@@ -926,7 +979,7 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
         if (delta != 0) {
           uint32_t new_lo = (uint32_t)(lo_imm + delta) & 0xFFFFu;
           lo_inst = (lo_inst & 0xFFFF0000u) | new_lo;
-          wr32(data + lo_target, lo_inst);
+          wr32(data + (size_t)lo_target, lo_inst);
         }
         continue;
       }
@@ -934,20 +987,15 @@ int prx_relocate_file(const char *in_path, const char *out_path) {
       if (delta == 0)
         continue;
 
-      uint32_t target = r_offset + seg_offset[ofs_base];
-      if ((uint64_t)target + 4 > (uint64_t)fsize) {
-        free(data);
-        return 2; /* Out of bounds write target */
-      }
-      uint32_t inst = rd32(data + target);
+      uint32_t inst = rd32(data + (size_t)target);
 
       if (type == R_MIPS_32) {
-        wr32(data + target, inst + delta);
+        wr32(data + (size_t)target, inst + delta);
       } else if (type == R_MIPS_26) {
         uint32_t jump_target = (inst & 0x03FFFFFFu) << 2;
         jump_target += delta;
         inst = (inst & 0xFC000000u) | ((jump_target >> 2) & 0x03FFFFFFu);
-        wr32(data + target, inst);
+        wr32(data + (size_t)target, inst);
       }
     }
   }
@@ -1348,39 +1396,17 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
     return false;
   }
 
-  /* STEP 3: All outputs in staging are 100% validated! Commit/Swap to production! */
+  /* Write installation manifest inside staging FIRST before altering live files */
   if (cb)
-    cb(94.0f, "Publishing validated game assets to installation directory...");
-
-  ensure_dir("game_root/disc/PSP_GAME");
-  ensure_dir("extracted");
-
-  if (!recursive_copy_dir(staging_disc, "game_root/disc/PSP_GAME")) {
-    recursive_delete_dir(staging_root);
-    if (cb)
-      cb(0.0f, "Failed to copy staged game assets to game_root.");
-    return false;
-  }
-
-  CopyFileA("staging_install/extracted/EBOOT.BIN", "extracted/EBOOT.BIN", FALSE);
-  CopyFileA("staging_install/extracted/EBOOT.ELF", "extracted/EBOOT.ELF", FALSE);
-  if (!CopyFileA("staging_install/extracted/EBOOT_RELOC.ELF",
-                 "extracted/EBOOT_RELOC.ELF", FALSE)) {
-    recursive_delete_dir(staging_root);
-    if (cb)
-      cb(0.0f,
-         "Failed to copy validated EBOOT_RELOC.ELF to extracted/ folder.");
-    return false;
-  }
-
-  /* Step 4: Write installation manifest ONLY after all outputs are validated and published */
-  if (cb)
-    cb(98.0f, "Saving installation manifest and linking game assets...");
-  FILE *f_manifest = fopen("install_manifest.txt", "w");
+    cb(94.0f, "Writing installation manifest in staging...");
+  char staging_manifest[MAX_PATH];
+  snprintf(staging_manifest, sizeof(staging_manifest), "%s/install_manifest.txt",
+           staging_root);
+  FILE *f_manifest = fopen(staging_manifest, "w");
   if (!f_manifest) {
     recursive_delete_dir(staging_root);
     if (cb)
-      cb(0.0f, "Failed to write install_manifest.txt.");
+      cb(0.0f, "Failed to write staging install_manifest.txt.");
     return false;
   }
   fprintf(f_manifest, "[INSTALL_MANIFEST]\n");
@@ -1389,14 +1415,97 @@ bool iso_run_installation(const char *iso_path, iso_progress_cb cb) {
   fprintf(f_manifest, "iso_source=%s\n", iso_path);
   fprintf(f_manifest, "status=INSTALLED_READY\n");
   if (fclose(f_manifest) != 0) {
-    safe_remove_file("install_manifest.txt");
     recursive_delete_dir(staging_root);
     if (cb)
-      cb(0.0f, "Failed to flush install_manifest.txt to disk.");
+      cb(0.0f, "Failed to flush staging manifest to disk.");
     return false;
   }
 
-  /* Clean up staging directory */
+  /* STEP 3: Atomic tree swap with rollback to prevent mixed installation */
+  if (cb)
+    cb(96.0f, "Publishing validated game assets via atomic directory swap...");
+
+  const char *backup_root = "install_backup";
+  if (dir_exists(backup_root)) {
+    recursive_delete_dir(backup_root);
+  }
+  ensure_dir(backup_root);
+
+  bool had_disc = dir_exists("game_root/disc/PSP_GAME");
+  bool had_extracted = dir_exists("extracted");
+  bool had_manifest = file_exists("install_manifest.txt");
+
+  bool backup_ok = true;
+  if (had_disc) {
+    char bkp_disc[MAX_PATH];
+    snprintf(bkp_disc, sizeof(bkp_disc), "%s/PSP_GAME", backup_root);
+    if (!move_or_copy_dir("game_root/disc/PSP_GAME", bkp_disc)) {
+      backup_ok = false;
+    }
+  }
+  if (backup_ok && had_extracted) {
+    char bkp_ext[MAX_PATH];
+    snprintf(bkp_ext, sizeof(bkp_ext), "%s/extracted", backup_root);
+    if (!move_or_copy_dir("extracted", bkp_ext)) {
+      backup_ok = false;
+    }
+  }
+  if (backup_ok && had_manifest) {
+    char bkp_man[MAX_PATH];
+    snprintf(bkp_man, sizeof(bkp_man), "%s/install_manifest.txt", backup_root);
+    if (!MoveFileA("install_manifest.txt", bkp_man)) {
+      if (!CopyFileA("install_manifest.txt", bkp_man, FALSE)) {
+        backup_ok = false;
+      } else {
+        safe_remove_file("install_manifest.txt");
+      }
+    }
+  }
+
+  if (!backup_ok) {
+    /* If backing up existing install failed, restore and abort without touching live state */
+    rollback_installation(backup_root, had_disc, had_extracted, had_manifest);
+    recursive_delete_dir(backup_root);
+    recursive_delete_dir(staging_root);
+    if (cb)
+      cb(0.0f, "Failed to backup existing installation before publishing.");
+    return false;
+  }
+
+  /* Swap staged assets into production */
+  bool swap_ok = true;
+  ensure_dir("game_root/disc");
+  if (!move_or_copy_dir(staging_disc, "game_root/disc/PSP_GAME")) {
+    swap_ok = false;
+  }
+  if (swap_ok) {
+    char staging_ext[MAX_PATH];
+    snprintf(staging_ext, sizeof(staging_ext), "%s/extracted", staging_root);
+    if (!move_or_copy_dir(staging_ext, "extracted")) {
+      swap_ok = false;
+    }
+  }
+  if (swap_ok) {
+    if (!MoveFileA(staging_manifest, "install_manifest.txt")) {
+      if (!CopyFileA(staging_manifest, "install_manifest.txt", FALSE)) {
+        swap_ok = false;
+      }
+    }
+  }
+
+  if (!swap_ok) {
+    /* Swap failed! Roll back production to previous intact state */
+    if (cb)
+      cb(0.0f,
+         "Publish failed midway; rolling back to previous installation...");
+    rollback_installation(backup_root, had_disc, had_extracted, had_manifest);
+    recursive_delete_dir(backup_root);
+    recursive_delete_dir(staging_root);
+    return false;
+  }
+
+  /* Installation succeeded! Clean up backup and staging trees */
+  recursive_delete_dir(backup_root);
   recursive_delete_dir(staging_root);
 
   if (cb)

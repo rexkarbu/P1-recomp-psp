@@ -54,6 +54,9 @@ launcher_config.ini
 *.ppm
 *.png
 *.bmp
+*.mp4
+*.wav
+scratch/
 !assets/**/*.png
 !assets/**/*.ico
 trace_ge.log

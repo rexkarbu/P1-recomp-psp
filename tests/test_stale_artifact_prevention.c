@@ -157,6 +157,27 @@ int main(void) {
     assert(!file_exists("out.elf"));
     printf("  - Out-of-bounds segment index: REJECTED SAFELY (PASS)\n");
 
+    /* Test 2b: Relocation offset 32-bit integer wrap (r_offset = 0xFFFFFFF0) */
+    uint8_t wrap_elf[256] = {0};
+    memcpy(wrap_elf, bad_seg_elf, sizeof(wrap_elf));
+    /* Valid segment 0, but r_offset wraps around 32-bit: 0xFFFFFFF0 */
+    *(uint32_t *)(wrap_elf + 124 + 0) = 0xFFFFFFF0u; /* r_offset */
+    *(uint32_t *)(wrap_elf + 124 + 4) = (0 << 8) | 2; /* R_MIPS_32, ofs_base=0 */
+    create_file("wrap.elf", wrap_elf, sizeof(wrap_elf));
+    assert(prx_relocate_file("wrap.elf", "out_wrap.elf") == 2);
+    assert(!file_exists("out_wrap.elf"));
+    printf("  - 32-bit integer wrap in r_offset (0xFFFFFFF0): REJECTED SAFELY (PASS)\n");
+
+    /* Test 2c: Relocation offset exceeding segment filesz (r_offset = 500 > seg_filesz = 100) */
+    uint8_t oob_elf[256] = {0};
+    memcpy(oob_elf, bad_seg_elf, sizeof(oob_elf));
+    *(uint32_t *)(oob_elf + 124 + 0) = 500; /* r_offset = 500, but seg_filesz is 100 */
+    *(uint32_t *)(oob_elf + 124 + 4) = (0 << 8) | 2; /* ofs_base=0 */
+    create_file("oob.elf", oob_elf, sizeof(oob_elf));
+    assert(prx_relocate_file("oob.elf", "out_oob.elf") == 2);
+    assert(!file_exists("out_oob.elf"));
+    printf("  - Relocation offset exceeding segment filesz: REJECTED SAFELY (PASS)\n");
+
     /* ------------------------------------------------------------- */
     /* TEST 3: Staged Installation & Stale Artifact Isolation        */
     /* ------------------------------------------------------------- */
@@ -171,6 +192,38 @@ int main(void) {
     assert(file_exists("staging_install") == false);
     assert(iso_is_game_installed() == false);
     printf("  - Failed installation safely aborted in staging with zero residue: (PASS)\n");
+
+    /* ------------------------------------------------------------- */
+    /* TEST 4: Existing Installation Preservation on Failed Update   */
+    /* ------------------------------------------------------------- */
+    printf("\n[TEST 4] Testing that existing install is preserved on failed ISO update...\n");
+    CreateDirectoryA("game_root", NULL);
+    CreateDirectoryA("game_root/disc", NULL);
+    CreateDirectoryA("game_root/disc/PSP_GAME", NULL);
+    CreateDirectoryA("game_root/disc/PSP_GAME/USRDIR", NULL);
+    create_file("game_root/disc/PSP_GAME/USRDIR/datapack.bin", "LIVE_DATAPACK", 13);
+    CreateDirectoryA("extracted", NULL);
+    create_file("extracted/EBOOT_RELOC.ELF", valid_elf, sizeof(valid_elf));
+    create_file("install_manifest.txt", "[INSTALL_MANIFEST]\nstatus=LIVE_READY\n", 37);
+
+    /* Attempt installation with invalid ISO */
+    bool update_res = iso_run_installation("corrupt_update.iso", NULL);
+    assert(update_res == false);
+
+    /* Verify existing files remain intact and unmodified */
+    assert(file_exists("install_manifest.txt") == true);
+    assert(file_exists("game_root/disc/PSP_GAME/USRDIR/datapack.bin") == true);
+    assert(file_exists("extracted/EBOOT_RELOC.ELF") == true);
+    assert(file_exists("staging_install") == false);
+    assert(file_exists("install_backup") == false);
+
+    FILE *mf = fopen("install_manifest.txt", "r");
+    assert(mf != NULL);
+    char m_buf[64] = {0};
+    fread(m_buf, 1, sizeof(m_buf) - 1, mf);
+    fclose(mf);
+    assert(strstr(m_buf, "LIVE_READY") != NULL);
+    printf("  - Existing installation and manifest 100%% preserved on update failure: (PASS)\n");
 
     /* Switch back to original CWD and clean up the sandbox directory */
     SetCurrentDirectoryA(original_cwd);

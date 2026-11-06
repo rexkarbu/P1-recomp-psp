@@ -400,9 +400,25 @@ static int park_us(uint64_t timeout_us) {
 
     int woken = 0;
     if (t) {
-        uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+        uint64_t real;
+        if (timeout_us == FRAME_US) {
+            /* 60 FPS real-time frame pacing: lock frame interval to ~16.667 ms */
+            static uint64_t s_target_frame_us = 0;
+            uint64_t now = host_now_us();
+            if (s_target_frame_us == 0 || now > s_target_frame_us + 33334ull) {
+                s_target_frame_us = now + 16667ull;
+                real = 16667ull;
+            } else {
+                s_target_frame_us += 16667ull;
+                now = host_now_us();
+                real = (s_target_frame_us > now) ? (s_target_frame_us - now) : 0;
+            }
+        } else {
+            real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+        }
+
         host_mutex_lock(&t->wlock);
-        if (!t->woken) {
+        if (!t->woken && real > 0) {
             uint64_t dl = host_deadline_us() + real;
             while (!t->woken) {
                 if (host_cond_until(&t->wcv, &t->wlock, dl))

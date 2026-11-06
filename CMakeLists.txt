@@ -82,3 +82,17 @@ target_link_libraries(test_stale_artifact_prevention PRIVATE
 add_executable(test_launcher_mgmt
     tests/test_launcher_mgmt.c
 )
+
+# --- CTest Registration ---
+enable_testing()
+add_test(NAME PathTraversalPrevention COMMAND test_path_traversal_prevention)
+add_test(NAME IsoBoundsChecking COMMAND test_iso_bounds_checking)
+add_test(NAME StaleArtifactPrevention COMMAND test_stale_artifact_prevention)
+add_test(NAME LauncherManagement COMMAND test_launcher_mgmt)
+set_tests_properties(
+    PathTraversalPrevention
+    IsoBoundsChecking
+    StaleArtifactPrevention
+    LauncherManagement
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)

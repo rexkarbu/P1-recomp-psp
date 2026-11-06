@@ -84,6 +84,59 @@ int main(void) {
     assert(is_path_inside_dir("C:/evil.dll", base) == false);
 
     printf("[PASS] Canonical path boundary verification passed!\n\n");
+
+    /* Test 4: End-to-end extract_iso_dir rejection of traversal payload */
+    printf("[TEST 4] Testing production extract_iso_dir() with synthetic traversal ISO...\n");
+    char orig_cwd[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, orig_cwd);
+    CreateDirectoryA("test_sandbox_traversal", NULL);
+    assert(SetCurrentDirectoryA("test_sandbox_traversal") != 0);
+
+    /* Create synthetic 64KB ISO with malicious directory record pointing to ../evil.exe */
+    uint8_t iso_buf[65536] = {0};
+    uint8_t *dir = iso_buf + (16 * 2048);
+
+    /* Record 0: Root "." */
+    dir[0] = 34; dir[25] = 2; dir[32] = 1; dir[33] = 0;
+    /* Record 1: Parent ".." */
+    dir[34] = 34; dir[34+25] = 2; dir[34+32] = 1; dir[34+33] = 1;
+
+    /* Record 2: Malicious traversal file "../evil.exe;1" */
+    uint8_t *mal_rec = dir + 68;
+    const char *mal_name = "../evil.exe;1";
+    uint8_t name_len = (uint8_t)strlen(mal_name);
+    uint8_t rec_len = (uint8_t)((33 + name_len + 1) & ~1);
+    mal_rec[0] = rec_len; /* length */
+    *(uint32_t *)(mal_rec + 2) = 20; /* extent_le (LBA 20) */
+    *(uint32_t *)(mal_rec + 10) = 100; /* size_le (100 bytes) */
+    mal_rec[25] = 0; /* regular file */
+    mal_rec[32] = name_len;
+    memcpy(mal_rec + 33, mal_name, name_len);
+
+    FILE *f_syn = fopen("synth_traversal.iso", "wb");
+    assert(f_syn != NULL);
+    fwrite(iso_buf, 1, sizeof(iso_buf), f_syn);
+    fclose(f_syn);
+
+    f_syn = fopen("synth_traversal.iso", "rb");
+    assert(f_syn != NULL);
+    uint64_t bytes = 0;
+    uint32_t errors = 0;
+    extract_iso_dir(f_syn, 16, 2048, "out_dest", &bytes, 2048, sizeof(iso_buf), &errors, NULL);
+    fclose(f_syn);
+
+    printf("  - Traversal entries detected by extract_iso_dir: %u error(s) logged\n", errors);
+    assert(errors > 0 && "extract_iso_dir must count traversal entry as error!");
+    assert(file_exists("evil.exe") == false && "evil.exe must not be written outside dest_dir!");
+    assert(file_exists("../evil.exe") == false && "evil.exe must not escape directory!");
+    assert(file_exists("out_dest/evil.exe") == false && "evil.exe must not be written!");
+
+    DeleteFileA("synth_traversal.iso");
+    RemoveDirectoryA("out_dest");
+    SetCurrentDirectoryA(orig_cwd);
+    RemoveDirectoryA("test_sandbox_traversal");
+
+    printf("[PASS] extract_iso_dir safely blocked traversal payload!\n\n");
     printf("=================================================================\n");
     printf("  ALL SECURITY TESTS PASSED SUCCESSFULLY! (100%% PROTECTED)      \n");
     printf("=================================================================\n");
