@@ -344,9 +344,6 @@ static void hle_ChReserve(void) {
     g_audio[ch].reserved = 1;
     g_audio[ch].samples = psp_arg(1);
     g_audio[ch].format  = psp_arg(2);
-#ifdef _WIN32
-    host_audio_open_ch(ch);
-#endif
     psp_ret((uint32_t)ch);
 }
 
@@ -383,6 +380,24 @@ static void hle_OutputPanned(void) {
     psp_ret(ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0);
 }
 
+#if PSPRECOMP_REAL_THREADS
+static inline uint64_t host_now_us(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart / freq.QuadPart) * 1000000ull +
+           (uint64_t)(now.QuadPart % freq.QuadPart) * 1000000ull / (uint64_t)freq.QuadPart;
+#else
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
+}
+static uint64_t g_audio_due_us[AUDIO_CHANNELS];
+#endif
+
 static void hle_OutputBlocking(void) {
     uint32_t ch = psp_arg(0);
     int vol = (int)psp_arg(1);
@@ -395,10 +410,35 @@ static void hle_OutputBlocking(void) {
     host_audio_play(ch, vol, vol, buf);
 #endif
     g_audio_blocks++;
-#if PSPRECOMP_REAL_THREADS
-    psp_threadman_yield();
-#else
     const uint64_t play_us = (uint64_t)samples * 1000000ull / 44100ull;
+#if PSPRECOMP_REAL_THREADS
+    if (ch < AUDIO_CHANNELS) {
+        uint64_t now = host_now_us();
+        if (g_audio_due_us[ch] == 0 || g_audio_due_us[ch] < now) {
+            g_audio_due_us[ch] = now;
+        }
+        g_audio_due_us[ch] += play_us;
+
+        now = host_now_us();
+        if (g_audio_due_us[ch] > now) {
+            uint64_t lead_us = g_audio_due_us[ch] - now;
+            if (lead_us > 50000ull) {
+                g_audio_due_us[ch] = now + 50000ull;
+                lead_us = 50000ull;
+            }
+            if (lead_us >= 25000ull) {
+                uint64_t wait_us = lead_us - 20000ull;
+                psp_threadman_delay(wait_us);
+            } else {
+                psp_threadman_yield();
+            }
+        } else {
+            psp_threadman_yield();
+        }
+    } else {
+        psp_threadman_yield();
+    }
+#else
     psp_threadman_delay(play_us);
 #endif
     psp_ret(samples);
@@ -418,10 +458,35 @@ static void hle_OutputPannedBlocking(void) {
     host_audio_play(ch, leftvol, rightvol, buf);
 #endif
     g_audio_blocks++;
-#if PSPRECOMP_REAL_THREADS
-    psp_threadman_yield();
-#else
     const uint64_t play_us = (uint64_t)samples * 1000000ull / 44100ull;
+#if PSPRECOMP_REAL_THREADS
+    if (ch < AUDIO_CHANNELS) {
+        uint64_t now = host_now_us();
+        if (g_audio_due_us[ch] == 0 || g_audio_due_us[ch] < now) {
+            g_audio_due_us[ch] = now;
+        }
+        g_audio_due_us[ch] += play_us;
+
+        now = host_now_us();
+        if (g_audio_due_us[ch] > now) {
+            uint64_t lead_us = g_audio_due_us[ch] - now;
+            if (lead_us > 50000ull) {
+                g_audio_due_us[ch] = now + 50000ull;
+                lead_us = 50000ull;
+            }
+            if (lead_us >= 25000ull) {
+                uint64_t wait_us = lead_us - 20000ull;
+                psp_threadman_delay(wait_us);
+            } else {
+                psp_threadman_yield();
+            }
+        } else {
+            psp_threadman_yield();
+        }
+    } else {
+        psp_threadman_yield();
+    }
+#else
     psp_threadman_delay(play_us);
 #endif
     psp_ret(samples);
@@ -456,6 +521,9 @@ void psp_misc_reset(void) {
     }
 #endif
     memset(g_audio, 0, sizeof g_audio);
+#if PSPRECOMP_REAL_THREADS
+    memset(g_audio_due_us, 0, sizeof g_audio_due_us);
+#endif
     g_audio_blocks = 0;
 }
 

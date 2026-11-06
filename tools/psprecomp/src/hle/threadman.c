@@ -357,7 +357,7 @@ static int cpu_wanted_locked(void) {
  * with nothing in it, and a wait that gives up has to be distinguishable from a
  * wait that was never needed. In practice this resolves in microseconds --
  * the thread it waits for is already blocked on the baton. */
-#define HANDOVER_CAP_US 2000     /* 2 ms of host time (reduced from 20ms to eliminate stutter) */
+#define HANDOVER_CAP_US 1000     /* 1 ms of host time */
 static int handover_wait_locked(void) {
     uint64_t dl = host_deadline_us() + HANDOVER_CAP_US;
 
@@ -414,7 +414,8 @@ static int park_us(uint64_t timeout_us) {
                 real = (s_target_frame_us > now) ? (s_target_frame_us - now) : 0;
             }
         } else {
-            real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+            /* Support bounded real-time delays (up to 25 ms) without artificial 400us slicing */
+            real = timeout_us < 25000ull ? timeout_us : 25000ull;
         }
 
         host_mutex_lock(&t->wlock);
@@ -1061,12 +1062,7 @@ static void hle_DeleteThread(void) {
  * interrupt per tick. A bounded park is what DelayThread is; a sleep is the
  * same shape with a wakeup as its exit. */
 static void park_ticks(uint64_t us, int kind) {
-    uint64_t left = us ? us : TICK_US;
-    while (left) {
-        uint64_t step = left < TICK_US ? left : TICK_US;
-        park_for(kind, step);
-        left -= step;
-    }
+    park_for(kind, us ? us : TICK_US);
 }
 
 /* One wait, one delivery -- the same contract as every other wait point here,
